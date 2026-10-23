@@ -52,7 +52,7 @@ To start with Windows (or use the toggle in the power popup):
 
 The logon task runs the dock elevated, so the installed copy lives in an admin-only folder (`%ProgramFiles%\mini-oled-dock\dock.exe`, inheriting the Program Files permissions) that normal programs cannot modify. Config, logs and icons stay in `%LOCALAPPDATA%\Dock`.
 
-**Update:** run `--install` again after rebuilding; if the installed dock is running it is asked to exit and restarted from the new copy. Installing from an older version also deletes the old `%LOCALAPPDATA%\Dock\bin\dock.exe` (if that old dock is still running the file cannot be deleted: remove it once it has exited).
+**Update:** run `--install` again after rebuilding; if the installed dock is running it is asked to exit and restarted from the new copy. If you installed an older version, an old copy may be left in `%LOCALAPPDATA%\Dock\bin`: `--install` reports it but does not delete it (an elevated delete in a user-writable folder is unsafe), so delete that folder yourself once the old dock has exited.
 
 **Uninstall:** `--uninstall` removes the logon task but keeps `%ProgramFiles%\mini-oled-dock` (it may be the copy currently running). Delete that folder from an elevated prompt if you no longer need it, and `%LOCALAPPDATA%\Dock` to remove your settings.
 

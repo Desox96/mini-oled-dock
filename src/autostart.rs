@@ -17,7 +17,8 @@
 //! TrustedInstaller write, Users read+execute); this module never sets or loosens an ACL. The task
 //! XML is staged in the same admin-only folder (not in `%LOCALAPPDATA%`, where a medium process could
 //! swap it between our write and `schtasks /Create`). The legacy `%LOCALAPPDATA%\Dock\bin\dock.exe`
-//! (medium-writable) is deleted by `--install`.
+//! (medium-writable) is NOT deleted by `--install`: an elevated delete inside a medium-writable folder
+//! could be redirected by a junction/symlink to an arbitrary file. The user is told to remove it.
 //!
 //! THREADING: all functions block (child processes, waits): NEVER from the UI thread. The power
 //! popup calls them from throwaway threads.
@@ -277,27 +278,19 @@ pub fn enable(allow_stop: bool) -> Result<bool, String> {
     Ok(stopped)
 }
 
-/// Best-effort removal of the legacy medium-writable copy `%LOCALAPPDATA%\Dock\bin\dock.exe` and of
-/// the `bin` folder if it is then empty. Failures (e.g. the old copy is still running) are logged only.
-fn remove_legacy_copy() {
+/// Tells the user about a leftover legacy copy `%LOCALAPPDATA%\Dock\bin\dock.exe`. It is never deleted
+/// here: this process is elevated and the folder is medium-writable, so a planted junction or symlink
+/// could turn the delete into an arbitrary-file delete. Deleting it as the normal user is safe.
+fn report_legacy_copy() {
     let old = legacy_exe();
-    if old.exists() {
-        match std::fs::remove_file(&old) {
-            Ok(()) => log!("autostart: legacy copy {} removed", old.display()),
-            Err(e) => {
-                log!("autostart: could not remove the legacy copy {}: {e}", old.display());
-                crate::logger::say(&format!(
-                    "Note: the old copy {} could not be removed ({e}); delete it once that dock has exited.",
-                    old.display()
-                ));
-            }
-        }
-    }
-    if let Some(bin) = old.parent().filter(|b| b.is_dir()) {
-        // remove_dir only succeeds on an empty folder.
-        match std::fs::remove_dir(bin) {
-            Ok(()) => log!("autostart: legacy folder {} removed", bin.display()),
-            Err(e) => log!("autostart: legacy folder {} not removed: {e}", bin.display()),
+    // symlink_metadata does not follow reparse points: this only reports, nothing is opened or changed.
+    if std::fs::symlink_metadata(&old).is_ok() {
+        log!("autostart: legacy copy {} still present (not deleted by the elevated installer)", old.display());
+        if let Some(bin) = old.parent() {
+            crate::logger::say(&format!(
+                "Note: an old copy is left in {}. Delete that folder yourself (no admin rights needed).",
+                bin.display()
+            ));
         }
     }
 }
@@ -350,7 +343,7 @@ pub fn run_install_cli() -> i32 {
         Ok(stopped) => {
             crate::logger::say(&format!("Installed to {}", dest.display()));
             crate::logger::say("Automatic start at logon enabled (scheduled task 'Dock', elevated).");
-            remove_legacy_copy();
+            report_legacy_copy();
             if stopped {
                 relaunch(&dest);
             }
