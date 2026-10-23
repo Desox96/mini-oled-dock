@@ -8,9 +8,16 @@
 //! of the system language). `schtasks.exe` is launched with an absolute path in System32 (the
 //! dock is elevated: no PATH search) and with `CREATE_NO_WINDOW`.
 //!
-//! The "Dock" task runs the INSTALLED copy (`%LOCALAPPDATA%\Dock\bin\dock.exe`) with `--autostart`:
-//! this way rebuilding in `target\release` does not touch the exe started at logon, and updating is
-//! `cargo build --release` + `dock.exe --install`.
+//! The "Dock" task runs the INSTALLED copy (`%ProgramFiles%\mini-oled-dock\dock.exe`, resolved with
+//! `FOLDERID_ProgramFiles`) with `--autostart`: this way rebuilding in `target\release` does not touch
+//! the exe started at logon, and updating is `cargo build --release` + `dock.exe --install`.
+//!
+//! SECURITY: the task runs ELEVATED, so the file it runs must not be writable without admin rights.
+//! The install folder is created under Program Files and inherits its ACL (Administrators/SYSTEM/
+//! TrustedInstaller write, Users read+execute); this module never sets or loosens an ACL. The task
+//! XML is staged in the same admin-only folder (not in `%LOCALAPPDATA%`, where a medium process could
+//! swap it between our write and `schtasks /Create`). The legacy `%LOCALAPPDATA%\Dock\bin\dock.exe`
+//! (medium-writable) is deleted by `--install`.
 //!
 //! THREADING: all functions block (child processes, waits): NEVER from the UI thread. The power
 //! popup calls them from throwaway threads.
@@ -19,7 +26,9 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
 use crate::log;
 
@@ -30,9 +39,70 @@ const STOP_WAIT: Duration = Duration::from_secs(8);
 /// Maximum time for `schtasks.exe` before giving up on it.
 const SCHTASKS_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// `%LOCALAPPDATA%\Dock\bin\dock.exe`, the installed copy.
-pub fn installed_exe() -> PathBuf {
+/// Name of the install folder under `%ProgramFiles%`.
+const INSTALL_DIR_NAME: &str = "mini-oled-dock";
+
+/// `%ProgramFiles%` from `FOLDERID_ProgramFiles` (never hardcoded).
+fn program_files() -> Result<PathBuf, String> {
+    // SAFETY: valid known-folder id, no token (current user); the returned buffer is freed below.
+    let p = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None) }
+        .map_err(|e| format!("SHGetKnownFolderPath(ProgramFiles): {e}"))?;
+    // SAFETY: `p` is the NUL-terminated string returned by SHGetKnownFolderPath, read once.
+    let s = unsafe { p.to_string() };
+    // SAFETY: same pointer, allocated with CoTaskMemAlloc, not used after this line.
+    unsafe { CoTaskMemFree(Some(p.0 as *const std::ffi::c_void)) };
+    let s = s.map_err(|e| format!("ProgramFiles path: {e}"))?;
+    if s.trim().is_empty() {
+        return Err("ProgramFiles path is empty".into());
+    }
+    Ok(PathBuf::from(s))
+}
+
+/// `%ProgramFiles%\mini-oled-dock` (admin-only install folder).
+fn install_dir() -> Result<PathBuf, String> {
+    Ok(program_files()?.join(INSTALL_DIR_NAME))
+}
+
+/// `%ProgramFiles%\mini-oled-dock\dock.exe`, the installed copy run by the logon task.
+pub fn installed_exe() -> Result<PathBuf, String> {
+    Ok(install_dir()?.join("dock.exe"))
+}
+
+/// Legacy install location `%LOCALAPPDATA%\Dock\bin\dock.exe` (medium-writable: migrated away).
+fn legacy_exe() -> PathBuf {
     crate::config::data_dir().join("bin").join("dock.exe")
+}
+
+/// true if `path` lies strictly inside `dir` (case-insensitive, separator-aware string check on
+/// already-canonical paths; `\\?\` prefixes must match on both sides). Pure.
+fn is_under(path: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches(['\\', '/']).to_lowercase();
+    let path = path.to_lowercase();
+    !dir.is_empty()
+        && path.len() > dir.len() + 1
+        && path.starts_with(&dir)
+        && path[dir.len()..].starts_with(['\\', '/'])
+}
+
+/// With `--autostart`: logs a warning if the running exe is not under `%ProgramFiles%` (the elevated
+/// logon task would then be running a file that a non-admin process may be able to replace).
+/// No other behaviour change.
+pub fn warn_if_not_installed() {
+    let (me, pf) = match (std::env::current_exe(), program_files()) {
+        (Ok(m), Ok(p)) => (m, p),
+        (Err(e), _) => return log!("autostart: WARNING cannot check the exe location: current_exe: {e}"),
+        (_, Err(e)) => return log!("autostart: WARNING cannot check the exe location: {e}"),
+    };
+    let me_c = std::fs::canonicalize(&me).unwrap_or_else(|_| me.clone());
+    let pf_c = std::fs::canonicalize(&pf).unwrap_or_else(|_| pf.clone());
+    if !is_under(&me_c.to_string_lossy(), &pf_c.to_string_lossy()) {
+        log!(
+            "autostart: WARNING running elevated at logon from {}, which is not under {}: a non-admin \
+             process may be able to replace this file. Run `dock.exe --install` again to move it to Program Files.",
+            me.display(),
+            pf.display()
+        );
+    }
 }
 
 fn schtasks_path() -> PathBuf {
@@ -124,7 +194,9 @@ fn task_xml(user: &str, exe: &Path) -> String {
 /// Registers the task (replacing an existing one) that starts `exe --autostart` at logon.
 fn register_task(exe: &Path) -> Result<(), String> {
     let user = current_user()?;
-    let dir = crate::config::ensure_data_dir().ok_or_else(|| "data folder could not be created".to_string())?;
+    // Staged in the admin-only install folder: see the SECURITY note in the module docs.
+    let dir = install_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let xml_path = dir.join("autostart-task.xml");
     // schtasks reads the XML as UTF-16 LE with BOM.
     let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
@@ -198,11 +270,36 @@ fn copy_self(dest: &Path, allow_stop: bool) -> Result<bool, String> {
 /// the destination (only from `--install`; the popup toggle must not close itself).
 /// Returns `true` if an instance was stopped.
 pub fn enable(allow_stop: bool) -> Result<bool, String> {
-    let dest = installed_exe();
+    let dest = installed_exe()?;
     let stopped = copy_self(&dest, allow_stop)?;
     register_task(&dest)?;
     log!("autostart: task '{TASK_NAME}' registered -> {}", dest.display());
     Ok(stopped)
+}
+
+/// Best-effort removal of the legacy medium-writable copy `%LOCALAPPDATA%\Dock\bin\dock.exe` and of
+/// the `bin` folder if it is then empty. Failures (e.g. the old copy is still running) are logged only.
+fn remove_legacy_copy() {
+    let old = legacy_exe();
+    if old.exists() {
+        match std::fs::remove_file(&old) {
+            Ok(()) => log!("autostart: legacy copy {} removed", old.display()),
+            Err(e) => {
+                log!("autostart: could not remove the legacy copy {}: {e}", old.display());
+                crate::logger::say(&format!(
+                    "Note: the old copy {} could not be removed ({e}); delete it once that dock has exited.",
+                    old.display()
+                ));
+            }
+        }
+    }
+    if let Some(bin) = old.parent().filter(|b| b.is_dir()) {
+        // remove_dir only succeeds on an empty folder.
+        match std::fs::remove_dir(bin) {
+            Ok(()) => log!("autostart: legacy folder {} removed", bin.display()),
+            Err(e) => log!("autostart: legacy folder {} not removed: {e}", bin.display()),
+        }
+    }
 }
 
 /// Removes the task (the installed files stay). If it does not exist it is not an error.
@@ -241,12 +338,21 @@ fn relaunch(exe: &Path) {
 
 /// `--install`: returns the exit code.
 pub fn run_install_cli() -> i32 {
+    let dest = match installed_exe() {
+        Ok(d) => d,
+        Err(e) => {
+            log!("autostart: --install failed: {e}");
+            crate::logger::say(&format!("Installation failed: {e}"));
+            return 1;
+        }
+    };
     match enable(true) {
         Ok(stopped) => {
-            crate::logger::say(&format!("Installed to {}", installed_exe().display()));
+            crate::logger::say(&format!("Installed to {}", dest.display()));
             crate::logger::say("Automatic start at logon enabled (scheduled task 'Dock', elevated).");
+            remove_legacy_copy();
             if stopped {
-                relaunch(&installed_exe());
+                relaunch(&dest);
             }
             0
         }
@@ -262,7 +368,11 @@ pub fn run_install_cli() -> i32 {
 pub fn run_uninstall_cli() -> i32 {
     match disable() {
         Ok(()) => {
-            crate::logger::say("Automatic start removed (the files in %LOCALAPPDATA%\\Dock\\bin remain).");
+            let where_ = installed_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| INSTALL_DIR_NAME.into());
+            crate::logger::say(&format!(
+                "Automatic start removed. The installed copy {where_} is kept (it may be running); \
+                 delete its folder from an elevated prompt if you no longer need it."
+            ));
             0
         }
         Err(e) => {
@@ -270,5 +380,23 @@ pub fn run_uninstall_cli() -> i32 {
             crate::logger::say(&format!("Removal failed: {e}"));
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn under_program_files() {
+        let pf = r"C:\Program Files";
+        assert!(is_under(r"C:\Program Files\mini-oled-dock\dock.exe", pf));
+        assert!(is_under(r"c:\program files\x.exe", r"C:\Program Files\"));
+        assert!(is_under(r"\\?\C:\Program Files\x.exe", r"\\?\C:\Program Files"));
+        assert!(!is_under(r"C:\Program Files (x86)\x.exe", pf));
+        assert!(!is_under(r"C:\Program FilesEvil\x.exe", pf));
+        assert!(!is_under(r"C:\Users\u\AppData\Local\Dock\bin\dock.exe", pf));
+        assert!(!is_under(pf, pf));
+        assert!(!is_under(r"C:\x.exe", ""));
     }
 }

@@ -146,7 +146,7 @@ pub struct Args {
     pub preview: Option<String>,
     /// `--list-apps`: print the open app windows with their resolved names and exit.
     pub list_apps: bool,
-    /// `--install`: copy the exe to `%LOCALAPPDATA%\Dock\bin` and register the logon autostart.
+    /// `--install`: copy the exe to `%ProgramFiles%\mini-oled-dock` and register the logon autostart.
     pub install: bool,
     /// `--uninstall`: remove the logon autostart.
     pub uninstall: bool,
@@ -272,6 +272,7 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
                     }
                 });
                 if config::poll_changed() {
+                    tray_host::invalidate_trust_cache();
                     ui::on_config_changed();
                 }
                 trim_tick();
@@ -893,6 +894,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     if args.autostart {
+        autostart::warn_if_not_installed();
         wait_for_shell();
     }
     install_panic_hook();

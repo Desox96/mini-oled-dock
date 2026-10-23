@@ -41,16 +41,20 @@ cargo build --release
 .\target\release\dock.exe
 ```
 
-The exe asks for administrator rights (UAC prompt): a non-elevated process cannot manage windows of elevated apps, receive the Win key over them, or fully manage the native taskbar. Apps launched from the dock inherit the elevated token.
+The exe asks for administrator rights (UAC prompt): a non-elevated process cannot manage windows of elevated apps, receive the Win key over them, or fully manage the native taskbar. Apps launched from the dock do NOT inherit the elevated token: they are started through the desktop shell as your normal user (if that is not possible the launch is refused).
 
 To start with Windows (or use the toggle in the power popup):
 
 ```powershell
-.\target\release\dock.exe --install     # copies the exe to %LOCALAPPDATA%\Dock\bin and registers a logon task
+.\target\release\dock.exe --install     # copies the exe to %ProgramFiles%\mini-oled-dock and registers a logon task
 .\target\release\dock.exe --uninstall   # removes the logon task
 ```
 
-Run `--install` again after rebuilding to update the installed copy.
+The logon task runs the dock elevated, so the installed copy lives in an admin-only folder (`%ProgramFiles%\mini-oled-dock\dock.exe`, inheriting the Program Files permissions) that normal programs cannot modify. Config, logs and icons stay in `%LOCALAPPDATA%\Dock`.
+
+**Update:** run `--install` again after rebuilding; if the installed dock is running it is asked to exit and restarted from the new copy. Installing from an older version also deletes the old `%LOCALAPPDATA%\Dock\bin\dock.exe` (if that old dock is still running the file cannot be deleted: remove it once it has exited).
+
+**Uninstall:** `--uninstall` removes the logon task but keeps `%ProgramFiles%\mini-oled-dock` (it may be the copy currently running). Delete that folder from an elevated prompt if you no longer need it, and `%LOCALAPPDATA%\Dock` to remove your settings.
 
 ## Usage
 
@@ -78,7 +82,15 @@ Run `--install` again after rebuilding to update the installed copy.
 
 Tray visibility and ordering (`tray_hidden`, `app_order`, `tray_order`, `modules_order`) are written by the dock itself.
 
-A pinned app looks like this; `launch` is an exe path or `shell:AppsFolder\<AUMID>` (list AUMIDs with `Get-StartApps`), `icon` is an optional PNG in `%LOCALAPPDATA%\Dock\icons\`. Pinning from the right-click menu fills it in for you.
+**Tray icons of elevated apps.** The dock runs as administrator, so by default it refuses to send click, hover and menu messages to a tray icon whose window belongs to another elevated program: otherwise any normal program could register a fake icon pointing at an elevated window and use the dock to deliver messages Windows would block (a UIPI bypass). This opt-in is deliberately not in `config.json` (any program can write that file); it is an admin-only registry value. To enable it, from an elevated PowerShell:
+
+```powershell
+New-Item -Path HKLM:\SOFTWARE\mini-oled-dock -Force; Set-ItemProperty HKLM:\SOFTWARE\mini-oled-dock TrustElevatedTrayIcons 1 -Type DWord
+```
+
+It is picked up within about 10 s. Set it to `0` or delete the key to turn it off. System messages (below `WM_USER`) are never forwarded to elevated windows either way.
+
+A pinned app looks like this; `launch` is an exe path or `shell:AppsFolder\<AUMID>` (list AUMIDs with `Get-StartApps`), `icon` is an optional PNG in `%LOCALAPPDATA%\Dock\icons\`, given as a plain file name only (paths, `..`, drive letters and UNC paths are rejected). Pinning from the right-click menu fills it in for you. Apps are always started without administrator rights, through the desktop shell, even though the dock itself is elevated; if that is not possible the launch is refused rather than run elevated.
 
 ```jsonc
 { "key": "c:\\program files\\discord\\discord.exe", "name": "Discord",

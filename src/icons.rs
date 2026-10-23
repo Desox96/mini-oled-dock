@@ -98,21 +98,68 @@ pub fn cache_path(key: &str) -> PathBuf {
     crate::config::cache_dir().join(format!("{}.png", sanitize_key(key)))
 }
 
-/// Path of the user's custom icon for `key`: if `configured` (the pin's `icon` field) is
-/// present and relative, `icons_dir()/<configured>`; if absolute, that path; otherwise
-/// `icons_dir()/<sanitize_key(key)>.png`. Returns `Some` only if the file exists.
-/// If `configured` is given but the file is missing, the by-key name is still tried.
+/// Path of the user's custom icon for `key`: if `configured` (the pin's `icon` field) is a valid
+/// plain file name (`is_plain_icon_name`), `icons_dir()/<configured>`; otherwise
+/// `icons_dir()/<sanitize_key(key)>.png`. Returns `Some` only if the file exists and, once
+/// resolved (symlinks included), its parent is `icons_dir()` itself.
+/// If `configured` is rejected or missing, the by-key name is still tried.
+///
+/// SECURITY: the config is writable by any medium-integrity process while the dock runs
+/// elevated, so `configured` is untrusted: absolute, UNC, `..` or ADS paths are rejected
+/// (they would make the elevated process read arbitrary files or authenticate to remote hosts).
 pub fn custom_icon_path(key: &str, configured: Option<&str>) -> Option<PathBuf> {
     let dir = crate::config::icons_dir();
     if let Some(c) = configured.map(str::trim).filter(|s| !s.is_empty()) {
-        let p = Path::new(c);
-        let full = if p.is_absolute() { p.to_path_buf() } else { dir.join(p) };
-        if full.is_file() {
+        if !is_plain_icon_name(c) {
+            crate::log!("icons: custom icon '{c}' rejected: only a plain file name inside the icons folder is allowed");
+        } else if let Some(full) = resolve_inside(&dir, c) {
             return Some(full);
         }
     }
-    let by_key = dir.join(format!("{}.png", sanitize_key(key)));
-    by_key.is_file().then_some(by_key)
+    resolve_inside(&dir, &format!("{}.png", sanitize_key(key)))
+}
+
+/// `dir/<name>` if it is an existing file whose canonical parent is the canonical `dir`
+/// (defeats symlinks / reparse points that lead outside the icons folder).
+fn resolve_inside(dir: &Path, name: &str) -> Option<PathBuf> {
+    let full = dir.join(name);
+    if !full.is_file() {
+        return None;
+    }
+    let canon_dir = std::fs::canonicalize(dir).ok()?;
+    let canon = std::fs::canonicalize(&full).ok()?;
+    if canon.parent() == Some(canon_dir.as_path()) {
+        Some(full)
+    } else {
+        crate::log!("icons: custom icon '{}' resolves outside the icons folder, rejected", full.display());
+        None
+    }
+}
+
+/// Windows reserved device names (with or without extension they never name a regular file).
+const RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+    "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// true if `name` is a single, plain file name: one `Normal` path component, no separators
+/// (`\` or `/`), no `.`/`..`, no drive/UNC/verbatim prefix, no `:` (drive or alternate data
+/// stream), no wildcard/control characters, no trailing dot or space (Win32 strips them),
+/// not a reserved device name, at most 255 characters. Pure.
+pub fn is_plain_icon_name(name: &str) -> bool {
+    use std::path::Component;
+    if name.is_empty() || name.len() > 255 || name.ends_with(['.', ' ']) {
+        return false;
+    }
+    if name.chars().any(|c| c.is_control() || matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')) {
+        return false;
+    }
+    let mut comps = Path::new(name).components();
+    if !matches!((comps.next(), comps.next()), (Some(Component::Normal(_)), None)) {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    !RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(stem))
 }
 
 // ------------------------------------------------------------------ pixel: utilities
@@ -662,6 +709,39 @@ mod tests {
         let q = unpremultiply_px(premultiply_px(p));
         assert_eq!(q >> 24, 0x80);
         assert!(((q >> 16) & 255).abs_diff(0xFF) <= 2 && ((q >> 8) & 255).abs_diff(0x80) <= 2);
+    }
+
+    #[test]
+    fn plain_icon_names() {
+        for ok in ["discord.png", "my icon.png", "a.b.c.png", "x", "ÿ-ünicode.png"] {
+            assert!(is_plain_icon_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "..\\x.png",
+            "../x.png",
+            "sub\\x.png",
+            "sub/x.png",
+            "C:\\Windows\\x.png",
+            "C:x.png",
+            "\\\\server\\share\\x.png",
+            "\\\\?\\C:\\x.png",
+            "\\x.png",
+            "x.png:stream",
+            "x.png::$DATA",
+            "x.png.",
+            "x.png ",
+            "*.png",
+            "a\u{0}b.png",
+            "CON",
+            "nul.png",
+            "com1.txt",
+        ] {
+            assert!(!is_plain_icon_name(bad), "{bad:?}");
+        }
+        assert!(!is_plain_icon_name(&"a".repeat(256)));
     }
 
     #[test]

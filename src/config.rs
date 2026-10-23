@@ -347,7 +347,8 @@ fn render(c: &Config) -> String {
   //   "key"    grouping key: the AUMID, or the lowercase exe path
   //   "name"   label shown in the dock
   //   "launch" exe path, or "shell:AppsFolder\\<AUMID>" for Store/packaged apps
-  //   "icon"   optional custom icon: PNG file name inside %LOCALAPPDATA%\Dock\icons\
+  //   "icon"   optional custom icon: plain PNG file name inside %LOCALAPPDATA%\Dock\icons\
+  //            (e.g. "discord.png"; paths, "..", drive letters and UNC paths are rejected)
   // List the AUMIDs of installed apps with:  Get-StartApps   (PowerShell)
   "pinned": {pinned},
 
@@ -574,6 +575,13 @@ mod tests {
         assert!(c.autohide && c.show_date);
         assert_eq!(c.pinned[0].key, "a");
         assert!(c.pinned[0].icon.is_none());
+    }
+
+    #[test]
+    fn removed_keys_are_ignored() {
+        // The tray opt-in moved to HKLM: an old config that still has the key must parse.
+        let c = parse("{\"trust_elevated_tray_icons\": true, \"show_tray\": false}").unwrap();
+        assert!(!c.show_tray);
     }
 
     #[test]

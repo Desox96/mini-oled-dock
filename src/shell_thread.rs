@@ -1,7 +1,7 @@
 //! "shell" COM STA thread: everything that is COM, Shell or spawns processes.
 //!
 //! Does: program name resolution, icon extraction/caching, audio (`AudioController`),
-//! app launch (`ShellExecuteExW`). The UI thread NEVER does these things.
+//! app launch (de-elevated through the desktop shell, see `launch`). The UI thread NEVER does these things.
 //!
 //! PROTOCOL (neither side blocks the other):
 //!  * UI -> shell: `request(ShellRequest)`. Puts the request in an mpsc channel and posts the
@@ -18,6 +18,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -26,17 +27,18 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-use windows::core::{Interface, GUID, HSTRING, PCWSTR, PWSTR};
+use windows::core::{Interface, BSTR, GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, PROPERTYKEY, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::DeleteObject;
 use windows::Win32::Graphics::Gdi::HGDIOBJ;
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, WIN32_FIND_DATAW};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, IPersistFile, CLSCTX_ALL,
-    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, IDispatch, IPersistFile,
+    IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcessToken};
+use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR, VT_I4};
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
@@ -47,6 +49,10 @@ use windows::Win32::UI::Shell::{
     IShellLinkW, SHCreateItemFromParsingName, SHDefExtractIconW, SHGetFileInfoW, SHGetImageList, SHGetKnownFolderPath,
     Shell, ShellExecuteExW, ShellLink, KF_FLAG_DEFAULT, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, SHFILEINFOW,
     SHGFI_SYSICONINDEX, SHIL_JUMBO, SIGDN_NORMALDISPLAY, SIIGBF_ICONONLY,
+};
+use windows::Win32::UI::Shell::{
+    IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellWindows, SID_STopLevelBrowser, ShellWindows,
+    CSIDL_DESKTOP, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, DispatchMessageW, GetClassLongPtrW, GetMessageW, KillTimer, PeekMessageW, PostMessageW,
@@ -84,8 +90,8 @@ pub struct ResolveApp {
 pub enum ShellRequest {
     /// Resolve name (then icon): produces `ShellEvent::AppName` and `ShellEvent::AppIcon`.
     ResolveApp(ResolveApp),
-    /// Launch `target` with `ShellExecuteExW` (default verb): exe path, `shell:AppsFolder\...`,
-    /// `ms-settings:...`, `explorer.exe`. `args` only for exes.
+    /// Launch `target` (exe path, `shell:AppsFolder\...`, `ms-settings:...`) with optional `args`.
+    /// When the dock is elevated it ALWAYS runs de-elevated through the desktop shell, or not at all.
     Launch { target: String, args: Option<String> },
     /// Change the volume by `delta_percent` points (wheel: +-`audio::WHEEL_STEP_PERCENT`).
     VolumeAdjust { delta_percent: i32 },
@@ -224,9 +230,6 @@ const SAFETY_TIMER_MS: u32 = 1000;
 const SRC_ICON_PX: i32 = 256;
 /// `WM_GETICON` timeout towards other apps' windows.
 const GETICON_TIMEOUT_MS: u32 = 50;
-/// If true and the dock runs elevated, simple launches (path/`shell:`) go through `explorer.exe`
-/// so the app starts with the user's normal privileges and not as administrator.
-const DEELEVATE_LAUNCH: bool = true;
 /// `PKEY_FileDescription` ({0CEF7D53-FA64-11D1-A203-0000F81FEDEE}, 3). Defined here to avoid
 /// enabling the `Win32_Storage_EnhancedStorage` feature just for a constant.
 const PKEY_FILE_DESCRIPTION: PROPERTYKEY =
@@ -354,7 +357,11 @@ impl Shell {
     fn handle_request(&mut self, req: ShellRequest) {
         match req {
             ShellRequest::ResolveApp(r) => self.resolve_app(r),
-            ShellRequest::Launch { target, args } => launch(&target, args.as_deref()),
+            ShellRequest::Launch { target, args } => {
+                if let Err(e) = launch(&target, args.as_deref()) {
+                    log!("shell: Launch '{target}' not executed: {e}");
+                }
+            }
             ShellRequest::VolumeAdjust { delta_percent } => {
                 self.ensure_audio();
                 let st = self.audio.as_mut().map(|a| a.adjust(delta_percent));
@@ -384,7 +391,9 @@ impl Shell {
                 self.ensure_audio();
                 if let Some(Err(e)) = self.audio.as_mut().map(|a| a.set_default_output(&id)) {
                     log!("shell: SetDefaultOutput failed: {e}, opening ms-settings:sound");
-                    launch("ms-settings:sound", None);
+                    if let Err(e) = launch("ms-settings:sound", None) {
+                        log!("shell: Launch 'ms-settings:sound' not executed: {e}");
+                    }
                 }
                 let list = self.audio.as_ref().map(|a| a.list_outputs()).unwrap_or_default();
                 push_event(self.ui, ShellEvent::AudioOutputs(list));
@@ -1085,28 +1094,113 @@ fn is_elevated() -> bool {
     })
 }
 
-/// Launches `target` (exe path, `shell:AppsFolder\...`, `ms-settings:...`, `explorer.exe`).
-/// From the shell thread, does not block the UI. If the dock is elevated and the launch is "simple"
-/// (no arguments, existing path or `shell:`), it goes through `explorer.exe`, which
-/// delegates to the user's shell: the app starts without administrator privileges.
-fn launch(target: &str, args: Option<&str>) {
+/// Launches `target` (exe path, `shell:AppsFolder\...`, `ms-settings:...`) with optional `args`.
+/// From the shell thread, does not block the UI.
+///
+/// SECURITY: targets come from the config, which any medium-integrity process can write. When
+/// the dock is elevated, EVERY launch goes through the desktop shell (`desktop_shell_execute`),
+/// so it runs unelevated as the interactive user. If that path fails the launch is REFUSED:
+/// there is no elevated fallback. Even `ms-settings:` URIs are routed this way, because an
+/// elevated ShellExecute resolves protocol handlers through the merged HKCR view, which includes
+/// the medium-writable `HKCU\Software\Classes` (the classic fodhelper-style UAC bypass).
+fn launch(target: &str, args: Option<&str>) -> Result<(), String> {
     let target = target.trim();
     if target.is_empty() {
-        log!("shell: Launch with empty target, ignored");
-        return;
+        return Err("empty target".into());
     }
-    let simple = args.is_none()
-        && (target.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("shell:")) || Path::new(target).is_file());
-    if DEELEVATE_LAUNCH && simple && is_elevated() {
-        log!("shell: Launch '{target}' via explorer.exe (de-elevated)");
-        shell_execute("explorer.exe", Some(&format!("\"{target}\"")), None);
-    } else {
+    let args = args.map(str::trim).filter(|a| !a.is_empty());
+    let dir = Path::new(target)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty() && p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned());
+    if !is_elevated() {
         log!("shell: Launch '{target}' args={args:?}");
-        let dir = Path::new(target)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty() && p.is_dir())
-            .map(|p| p.to_string_lossy().into_owned());
-        shell_execute(target, args, dir.as_deref());
+        return shell_execute(target, args, dir.as_deref());
+    }
+    match desktop_shell_execute(target, args, dir.as_deref()) {
+        Ok(()) => {
+            log!("shell: Launch '{target}' args={args:?} via the desktop shell (de-elevated)");
+            Ok(())
+        }
+        Err(e) => {
+            log!("shell: de-elevated launch of '{target}' failed ({e}): REFUSED, never launching elevated");
+            Err(format!("de-elevated launch failed: {e}"))
+        }
+    }
+}
+
+/// Owned `VARIANT` that is released with `VariantClear` on drop.
+struct OwnedVariant(VARIANT);
+
+impl OwnedVariant {
+    /// `VT_EMPTY` (an omitted optional argument).
+    fn empty() -> Self {
+        OwnedVariant(VARIANT::default())
+    }
+
+    fn i4(n: i32) -> Self {
+        let mut v = VARIANT::default();
+        // SAFETY: `v` is a zeroed VARIANT (VT_EMPTY); writing the type tag and the matching union
+        // member produces a valid VT_I4 VARIANT.
+        unsafe {
+            let inner = &mut *v.Anonymous.Anonymous;
+            inner.vt = VT_I4;
+            inner.Anonymous.lVal = n;
+        }
+        OwnedVariant(v)
+    }
+
+    fn bstr(s: &str) -> Self {
+        let mut v = VARIANT::default();
+        // SAFETY: as in `i4`; the BSTR is owned by the VARIANT and freed by VariantClear in `drop`.
+        unsafe {
+            let inner = &mut *v.Anonymous.Anonymous;
+            inner.vt = VT_BSTR;
+            inner.Anonymous.bstrVal = ManuallyDrop::new(BSTR::from(s));
+        }
+        OwnedVariant(v)
+    }
+
+    fn opt_bstr(s: Option<&str>) -> Self {
+        s.map_or_else(Self::empty, Self::bstr)
+    }
+}
+
+impl Drop for OwnedVariant {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a valid VARIANT built by the constructors above and owned by us.
+        let _ = unsafe { VariantClear(&mut self.0) };
+    }
+}
+
+/// Runs `file` through the desktop shell (Explorer, at the user's medium integrity), so the new
+/// process is NOT elevated even when the dock is:
+/// `IShellWindows::FindWindowSW(CSIDL_DESKTOP)` -> `IServiceProvider::QueryService(SID_STopLevelBrowser)`
+/// -> `IShellBrowser::QueryActiveShellView` -> `IShellView::GetItemObject(SVGIO_BACKGROUND)`
+/// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., "open", SW_SHOWNORMAL)`.
+/// Must be called on a COM STA thread (the shell thread).
+fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>) -> windows::core::Result<()> {
+    // SAFETY: COM STA initialized on the shell thread; every interface below is used only on this
+    // thread and released when it goes out of scope. The VARIANTs passed by pointer outlive the calls.
+    unsafe {
+        let windows: IShellWindows = CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER)?;
+        let loc = OwnedVariant::i4(CSIDL_DESKTOP as i32);
+        let root = OwnedVariant::empty();
+        let mut hwnd = 0i32;
+        let desktop: IDispatch = windows.FindWindowSW(&loc.0, &root.0, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)?;
+        let sp: IServiceProvider = desktop.cast()?;
+        let browser: IShellBrowser = sp.QueryService(&SID_STopLevelBrowser)?;
+        let view = browser.QueryActiveShellView()?;
+        let background: IDispatch = view.GetItemObject(SVGIO_BACKGROUND)?;
+        let folder_view: IShellFolderViewDual = background.cast()?;
+        let shell: IShellDispatch2 = folder_view.Application()?.cast()?;
+        shell.ShellExecute(
+            &BSTR::from(file),
+            &OwnedVariant::opt_bstr(args).0,
+            &OwnedVariant::opt_bstr(dir).0,
+            &OwnedVariant::bstr("open").0,
+            &OwnedVariant::i4(SW_SHOWNORMAL.0).0,
+        )
     }
 }
 
@@ -1150,7 +1244,8 @@ fn send_win_d() {
     }
 }
 
-fn shell_execute(file: &str, params: Option<&str>, dir: Option<&str>) {
+/// Plain `ShellExecuteExW` (default verb). Used ONLY when the dock is not elevated.
+fn shell_execute(file: &str, params: Option<&str>, dir: Option<&str>) -> Result<(), String> {
     let file_w = HSTRING::from(file);
     let params_w = params.map(HSTRING::from);
     let dir_w = dir.map(HSTRING::from);
@@ -1166,9 +1261,7 @@ fn shell_execute(file: &str, params: Option<&str>, dir: Option<&str>) {
     };
     // SAFETY: `sei` initialized with the correct cbSize; the strings (NUL-terminated HSTRINGs) live
     // until the end of the function, which returns after ShellExecuteExW.
-    if let Err(e) = unsafe { ShellExecuteExW(&mut sei) } {
-        log!("shell: ShellExecuteExW('{file}') failed: {e}");
-    }
+    unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| format!("ShellExecuteExW: {e}"))
 }
 
 #[cfg(test)]

@@ -27,7 +27,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, GUID, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_SUCCESS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL,
     TOKEN_QUERY,
@@ -35,6 +37,7 @@ use windows::Win32::Security::{
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_SUBKEY_WOW6464KEY};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -649,14 +652,115 @@ fn allow_foreground(pid: u32) {
     }
 }
 
-fn send_callback(t: &Target, ev: u32, anchor: POINT) {
-    // A system callback (< WM_USER, e.g. WM_COMMAND/WM_SYSCOMMAND) towards an elevated owner
-    // would make the dock cross the UIPI boundary on behalf of whoever registered the icon: forbidden.
-    if t.callback < WM_USER && !pid_at_most_medium(t.pid) {
-        if ev == WM_MOUSEMOVE {
-            return;
+/// Pure gating decision for any message the dock sends on behalf of a tray registration
+/// (callback clicks, hover `WM_MOUSEMOVE`, `NIN_*`, `WM_CONTEXTMENU`).
+///
+/// UIPI: any medium-integrity process can register an icon whose owner HWND belongs to an elevated
+/// process. Our elevated dock would then deliver attacker-chosen messages across the integrity
+/// boundary. So owners above medium (or of unknown integrity) are refused, unless an administrator
+/// opted in (`trust_elevated_tray_icons`, HKLM registry); even then, system messages (`callback < WM_USER`, e.g.
+/// WM_COMMAND/WM_SYSCOMMAND) are never sent to them.
+fn callback_permitted(owner_at_most_medium: bool, callback: u32, trust_elevated: bool) -> bool {
+    owner_at_most_medium || (trust_elevated && callback >= WM_USER)
+}
+
+/// Admin-only opt-in: `HKLM\SOFTWARE\mini-oled-dock`, DWORD `TrustElevatedTrayIcons` (1 = trust).
+/// Deliberately NOT in config.json, which any medium-integrity process can write (the gate would
+/// fail open). HKLM\SOFTWARE is writable only by administrators.
+const TRUST_KEY: PCWSTR = w!("SOFTWARE\\mini-oled-dock");
+const TRUST_VALUE: PCWSTR = w!("TrustElevatedTrayIcons");
+/// Maximum age of the cached registry value.
+const TRUST_CACHE_TTL: Duration = Duration::from_secs(10);
+/// Cached (read time, value) of the opt-in; `None` = never read or invalidated.
+static TRUST_CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+
+/// Reads the opt-in from the 64-bit registry view. Default false on any error or if missing.
+fn read_trust_elevated_tray_icons() -> bool {
+    let mut data = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: `data`/`size` are valid writable locals of the declared size; key/value names are
+    // static NUL-terminated wide strings. RRF_RT_REG_DWORD guarantees at most 4 bytes are written.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            TRUST_KEY,
+            TRUST_VALUE,
+            RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY,
+            None,
+            Some((&mut data as *mut u32).cast::<c_void>()),
+            Some(&mut size),
+        )
+    };
+    r == ERROR_SUCCESS && data == 1
+}
+
+/// Cached opt-in, re-read from the registry at most every `TRUST_CACHE_TTL` (or after
+/// `invalidate_trust_cache`).
+fn trust_elevated_tray_icons() -> bool {
+    let mut c = TRUST_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((t, v)) = *c {
+        if t.elapsed() < TRUST_CACHE_TTL {
+            return v;
         }
-        log!("tray: callback 0x{:X} of #{} to elevated process rejected", t.callback, t.id);
+    }
+    let v = read_trust_elevated_tray_icons();
+    if c.is_none_or(|(_, old)| old != v) {
+        log!("tray: TrustElevatedTrayIcons (HKLM) = {v}");
+    }
+    *c = Some((Instant::now(), v));
+    v
+}
+
+/// Forces the next check to re-read the registry (called on config reload).
+pub fn invalidate_trust_cache() {
+    let mut c = TRUST_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    // Keep the last value (for change logging) but mark it as expired; if the clock cannot go
+    // back that far, simply forget it.
+    *c = match (*c, Instant::now().checked_sub(TRUST_CACHE_TTL)) {
+        (Some((_, v)), Some(expired)) => Some((expired, v)),
+        _ => None,
+    };
+}
+
+/// Owners for which a blocked callback was already logged (log once per owner). Bounded.
+static BLOCKED_LOGGED: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+const BLOCKED_LOGGED_CAP: usize = 256;
+
+/// true if the dock may send messages on behalf of icon `t`: the owner HWND still belongs to the
+/// registered pid and `callback_permitted` allows it. Logs once per owner when blocked.
+fn callback_allowed(t: &Target) -> bool {
+    if !owner_alive(t.owner, t.pid) {
+        return false;
+    }
+    let trust = trust_elevated_tray_icons();
+    if callback_permitted(pid_at_most_medium(t.pid), t.callback, trust) {
+        return true;
+    }
+    let mut logged = BLOCKED_LOGGED.lock().unwrap_or_else(|p| p.into_inner());
+    if !logged.contains(&t.owner) {
+        if logged.len() >= BLOCKED_LOGGED_CAP {
+            logged.clear();
+        }
+        logged.push(t.owner);
+        log!(
+            "tray: messages of icon #{} ({}, callback 0x{:X}) to owner 0x{:X} (pid {}) blocked: owner runs above medium integrity{}",
+            t.id,
+            t.exe,
+            t.callback,
+            t.owner,
+            t.pid,
+            if trust {
+                " and the callback is a system message"
+            } else {
+                " (see HKLM\\SOFTWARE\\mini-oled-dock TrustElevatedTrayIcons)"
+            }
+        );
+    }
+    false
+}
+
+fn send_callback(t: &Target, ev: u32, anchor: POINT) {
+    if !callback_allowed(t) {
         return;
     }
     let (wp, lp) = encode(t.version, t.uid, anchor.x, anchor.y, ev);
@@ -880,6 +984,9 @@ pub fn click(id: u64, kind: TrayClick, anchor: POINT) {
     }
     if t.callback == 0 {
         log!("tray: icon #{id} ({}) has no callback message", t.exe);
+        return;
+    }
+    if !callback_allowed(&t) {
         return;
     }
     allow_foreground(t.pid);
@@ -1955,6 +2062,21 @@ fn forward_main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elevated_owner_gating() {
+        // Medium (or lower) owners: always allowed, system callbacks included.
+        assert!(callback_permitted(true, WM_USER + 1, false));
+        assert!(callback_permitted(true, 0x0111, false));
+        // Elevated / unknown owners: blocked by default.
+        assert!(!callback_permitted(false, WM_USER + 1, false));
+        assert!(!callback_permitted(false, 0x0111, false));
+        // Opt-in: only private callbacks (>= WM_USER), never system messages.
+        assert!(callback_permitted(false, WM_USER, true));
+        assert!(callback_permitted(false, 0xC123, true));
+        assert!(!callback_permitted(false, 0x0111, true));
+        assert!(!callback_permitted(false, WM_USER - 1, true));
+    }
 
     fn nid(hwnd: u32, uid: u32, flags: u32) -> ShellTrayData {
         let mut d: ShellTrayData = from_prefix(&[]);
