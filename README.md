@@ -24,7 +24,7 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 
 - Centred bar sized to its content: pinned apps first, then open apps. An underline marks open windows (orange when an app asks for attention).
 - Display modes: icon + name, icon only, or name only.
-- Three bar sizes (height, icons and text scale together), pure black or dark grey background, adjustable background opacity.
+- Independent sizes for app icons, app names, tray icons and the system modules (the bar height follows the tallest content); background colour from dark presets or any colour through a built-in picker (pure black by default); background opacity from 0 to 100 %.
 - **Settings popup** (from the power button): every option above, auto-hide, clock seconds and the visible modules, applied live.
 - Network module: Wi-Fi signal bars or ethernet, with a small globe when the internet is reachable (an x when it is not); click for name, IPv4 and signal.
 - System metrics module (off by default): CPU and RAM usage in percent; click opens Task Manager.
@@ -72,7 +72,11 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 - **Volume:** wheel changes it, middle click mutes, left click opens the audio popup.
 - **Network:** left click opens the network popup (connection, internet, IPv4, signal, "Network settings"); right click opens Windows' network settings.
 - **System metrics:** click opens Task Manager.
-- **Settings:** power button, then **Settings**: position, display mode, size, background, opacity, auto-hide, clock seconds, one switch per module, and **Choose tray icons** (which tray icons stay in the bar). Every change applies at once and is saved to `config.json` (the comments are kept).
+- **Settings:** power button, then **Settings**: position, display mode, auto-hide, clock seconds, one switch per module, **Choose tray icons** (which tray icons stay in the bar) and two sub-pages:
+  - **Background ›**: seven dark presets (Black, Graphite, Slate, Navy, Plum, Wine, Forest) and a custom swatch that opens a colour picker (saturation/value square, hue strip, preview and hex code; drag to pick), plus the **Opacity** slider (0-100 %, background only: at 0 % only text and icons are visible and the bar still reacts to the mouse).
+  - **Sizes ›**: sliders for app icons, app names, tray icons and modules, and **Reset sizes**.
+
+  Sliders follow a drag or a click on the track, and the mouse wheel (opacity and modules in steps of 5 %, the others 1 px). Every change applies at once and is saved to `config.json` (the comments are kept); while you drag, the file is written when you release the button.
 - **Exit:** `Ctrl+Alt+Q`, or the power popup, or `dock.exe --restore`.
 
 ## Configuration
@@ -85,9 +89,12 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 |---|---|---|
 | `position` | `"bottom"` | `"top"` or `"bottom"` |
 | `display_mode` | `"icon_text"` | `"icon_text"`, `"icon"` or `"text"` |
-| `bar_size` | `"medium"` | `"small"`, `"medium"` or `"large"`: height, icons, text and spacing scale together |
-| `background` | `"black"` | `"black"` (pure #000, OLED) or `"dark"` (very dark grey); also used by the popups |
-| `bar_opacity` | `95` | Bar background opacity in percent, 50-100 (text and icons stay opaque) |
+| `app_icon_size` | `16` | App icon size in logical px, 14-32 |
+| `app_text_size` | `13` | App name text size in logical px, 10-18 |
+| `tray_icon_size` | `16` | Tray icon size in logical px, 12-24 |
+| `module_size` | `100` | Scale of the system modules (notifications, volume, network, metrics, clock, show desktop, power) in percent, 75-150 |
+| `background` | `"#000000"` | Background colour of the bar and the popups, `"#RRGGBB"` (the old values `"black"` and `"dark"` are still accepted) |
+| `bar_opacity` | `95` | Bar background opacity in percent, 0-100 (text and icons stay opaque) |
 | `autohide` | `true` | Hide the bar when the pointer leaves it |
 | `hide_native_taskbar` | `true` | Hide the Windows taskbar while the dock runs |
 | `show_date` / `date_format` | `true` / `"ddd d MMM"` | Date under the time (Windows date picture) |
@@ -99,6 +106,8 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | `show_notifications` / `show_volume` / `show_clock` / `show_desktop_button` | `true` | Show the other system modules (a hidden module costs nothing) |
 | `pinned` | `[]` | Pinned apps, in display order |
 | `names` | `{}` | Display-name overrides (key: lowercase exe name or AUMID) |
+
+The bar height follows the tallest content; the defaults give the original 36 px bar. An old `bar_size` value (`"small"`, `"medium"`, `"large"`) is converted once into the four sizes.
 
 Tray visibility and ordering (`tray_hidden`, `app_order`, `tray_order`, `modules_order`) are written by the dock itself.
 

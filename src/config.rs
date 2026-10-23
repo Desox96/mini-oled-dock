@@ -33,7 +33,8 @@ pub enum DisplayMode {
     Text,
 }
 
-/// Bar size: scales height, icons, text and spacing together (see `render::bar_dpi`).
+/// Legacy bar size (before the independent sizes): read only to migrate an old config once
+/// (`migrate_bar_size`), never written.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BarSize {
@@ -43,27 +44,102 @@ pub enum BarSize {
     Large,
 }
 
-/// Background tone of the bar and the popups: pure black (OLED) or a very dark grey.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Background {
-    #[default]
-    Black,
-    Dark,
-}
+/// Background colour of the bar and the popups, 0xRRGGBB. Written as "#RRGGBB"; the legacy
+/// values "black" and "dark" are still accepted. An unreadable value falls back to black instead
+/// of rejecting the whole file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Background(pub u32);
 
 impl Background {
+    /// Pure black (OLED), the default.
+    pub const BLACK: Background = Background(0x000000);
+    /// The legacy "dark" tone (very dark grey).
+    pub const DARK: Background = Background(0x1C1C1E);
+
     /// Background colour (not premultiplied).
     pub fn rgb(self) -> (u32, u32, u32) {
-        match self {
-            Background::Black => (0, 0, 0),
-            Background::Dark => (28, 28, 30),
+        ((self.0 >> 16) & 255, (self.0 >> 8) & 255, self.0 & 255)
+    }
+
+    /// "#RRGGBB" (upper case).
+    pub fn hex(self) -> String {
+        format!("#{:06X}", self.0 & 0xFF_FFFF)
+    }
+
+    /// Parses "#RRGGBB" / "RRGGBB" / "#RGB" (any case) or the legacy "black" / "dark".
+    pub fn parse(s: &str) -> Option<Background> {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("black") {
+            return Some(Background::BLACK);
+        }
+        if t.eq_ignore_ascii_case("dark") {
+            return Some(Background::DARK);
+        }
+        let h = t.strip_prefix('#').unwrap_or(t);
+        if !h.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        match h.len() {
+            6 => u32::from_str_radix(h, 16).ok().map(Background),
+            3 => {
+                let v = u32::from_str_radix(h, 16).ok()?;
+                let (r, g, b) = ((v >> 8) & 15, (v >> 4) & 15, v & 15);
+                Some(Background(((r * 17) << 16) | ((g * 17) << 8) | (b * 17)))
+            }
+            _ => None,
         }
     }
 }
 
-/// Opacity steps offered by the Settings popup (percent of the bar background).
-pub const OPACITY_STEPS: [u8; 4] = [100, 95, 85, 70];
+impl Serialize for Background {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for Background {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Background::parse(&s).unwrap_or_default())
+    }
+}
+
+/// Preset background colours offered by the Settings popup: dark tones that keep white text readable.
+pub const BACKGROUND_PRESETS: [(&str, Background); 7] = [
+    ("Black", Background::BLACK),
+    ("Graphite", Background::DARK),
+    ("Slate", Background(0x1A222D)),
+    ("Navy", Background(0x0E1A33)),
+    ("Plum", Background(0x261630)),
+    ("Wine", Background(0x2E1119)),
+    ("Forest", Background(0x10261B)),
+];
+
+/// Range of a size setting: `min..=max`; `default` reproduces the original look.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SizeRange {
+    pub min: u8,
+    pub max: u8,
+    pub default: u8,
+}
+
+impl SizeRange {
+    pub fn clamp(self, v: u8) -> u8 {
+        v.clamp(self.min, self.max)
+    }
+}
+
+/// App icon side (logical px).
+pub const APP_ICON_SIZE: SizeRange = SizeRange { min: 14, max: 32, default: 16 };
+/// App name text height (logical px; 13 px is the Windows UI text size at 100 %).
+pub const APP_TEXT_SIZE: SizeRange = SizeRange { min: 10, max: 18, default: 13 };
+/// Tray icon side (logical px).
+pub const TRAY_ICON_SIZE: SizeRange = SizeRange { min: 12, max: 24, default: 16 };
+/// Scale of the system modules on the right (percent).
+pub const MODULE_SIZE: SizeRange = SizeRange { min: 75, max: 150, default: 100 };
+
+/// Default opacity of the bar background (percent).
+pub const DEFAULT_BAR_OPACITY: u8 = 95;
 
 /// An app pinned to the dock.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
@@ -107,11 +183,20 @@ pub struct Config {
     pub show_desktop_button: bool,
     /// Entry display: "icon_text" | "icon" | "text".
     pub display_mode: DisplayMode,
-    /// Bar size: "small" | "medium" | "large".
-    pub bar_size: BarSize,
-    /// Background tone: "black" | "dark".
+    /// Legacy "small" | "medium" | "large": migrated to the four sizes below when read, never written.
+    #[serde(skip_serializing)]
+    pub bar_size: Option<BarSize>,
+    /// App icon side, logical px (`APP_ICON_SIZE`).
+    pub app_icon_size: u8,
+    /// App name text height, logical px (`APP_TEXT_SIZE`).
+    pub app_text_size: u8,
+    /// Tray icon side, logical px (`TRAY_ICON_SIZE`).
+    pub tray_icon_size: u8,
+    /// Scale of the system modules in percent (`MODULE_SIZE`).
+    pub module_size: u8,
+    /// Background colour of the bar and the popups ("#RRGGBB").
     pub background: Background,
-    /// Opacity of the bar background in percent (50..=100; text and icons stay fully opaque).
+    /// Opacity of the bar background in percent (0..=100; text and icons stay fully opaque).
     pub bar_opacity: u8,
     /// Clock picture for GetTimeFormatEx (default "HH:mm").
     pub time_format: String,
@@ -177,9 +262,13 @@ impl Default for Config {
             show_clock: true,
             show_desktop_button: true,
             display_mode: DisplayMode::IconText,
-            bar_size: BarSize::Medium,
-            background: Background::Black,
-            bar_opacity: 95,
+            bar_size: None,
+            app_icon_size: APP_ICON_SIZE.default,
+            app_text_size: APP_TEXT_SIZE.default,
+            tray_icon_size: TRAY_ICON_SIZE.default,
+            module_size: MODULE_SIZE.default,
+            background: Background::BLACK,
+            bar_opacity: DEFAULT_BAR_OPACITY,
             time_format: "HH:mm".to_string(),
             show_seconds: false,
             date_format: "ddd d MMM".to_string(),
@@ -292,7 +381,32 @@ fn strip_comments(src: &str) -> String {
 /// Parses the config (JSONC). Tolerates a leading UTF-8 BOM (Notepad). Missing fields = defaults.
 fn parse(text: &str) -> Result<Config, String> {
     let t = text.strip_prefix('\u{feff}').unwrap_or(text);
-    serde_json::from_str::<Config>(&strip_comments(t)).map_err(|e| e.to_string())
+    let mut c = serde_json::from_str::<Config>(&strip_comments(t)).map_err(|e| e.to_string())?;
+    migrate_bar_size(&mut c);
+    Ok(c)
+}
+
+/// Converts a legacy `bar_size` (one knob scaling the whole bar: small 7/8, medium 1, large 5/4)
+/// into the four independent sizes, unless those were already changed (a hand edit wins). Clears
+/// `bar_size`, which is never written back.
+fn migrate_bar_size(c: &mut Config) {
+    let Some(size) = c.bar_size.take() else { return };
+    let untouched = c.app_icon_size == APP_ICON_SIZE.default
+        && c.app_text_size == APP_TEXT_SIZE.default
+        && c.tray_icon_size == TRAY_ICON_SIZE.default
+        && c.module_size == MODULE_SIZE.default;
+    if !untouched {
+        return;
+    }
+    let (icon, text, tray, module) = match size {
+        BarSize::Small => (14, 11, 14, 88),
+        BarSize::Medium => return,
+        BarSize::Large => (20, 16, 20, 125),
+    };
+    c.app_icon_size = icon;
+    c.app_text_size = text;
+    c.tray_icon_size = tray;
+    c.module_size = module;
 }
 
 /// Marker on the first line of every file we write; a config without it is a legacy plain JSON
@@ -320,15 +434,7 @@ fn render(c: &Config) -> String {
         Position::Top => "top",
         Position::Bottom => "bottom",
     };
-    let size = match c.bar_size {
-        BarSize::Small => "small",
-        BarSize::Medium => "medium",
-        BarSize::Large => "large",
-    };
-    let bg = match c.background {
-        Background::Black => "black",
-        Background::Dark => "dark",
-    };
+    let bg = c.background.hex();
     format!(
         r#"{TEMPLATE_MARK}
 // Edit and save: changes are picked up within ~2 seconds, no restart needed.
@@ -345,14 +451,24 @@ fn render(c: &Config) -> String {
   // The indicator bar under each entry adapts to the chosen mode.
   "display_mode": "{mode}",
 
-  // Size of the bar: "small", "medium" or "large". Height, icons, text and spacing scale together.
-  "bar_size": "{size}",
+  // Sizes, each independent (the bar height follows the tallest content):
+  //   app_icon_size   app icons, 14-32 px (default 16)
+  //   app_text_size   app names, 10-18 px (default 13)
+  //   tray_icon_size  tray icons, 12-24 px (default 16)
+  //   module_size     notifications, volume, network, metrics, clock, show desktop and power,
+  //                   75-150 % (default 100)
+  // Logical pixels: the Windows display scaling is applied on top.
+  "app_icon_size": {icon_size},
+  "app_text_size": {text_size},
+  "tray_icon_size": {tray_size},
+  "module_size": {module_size},
 
-  // Background of the bar and the popups: "black" (pure #000, ideal for OLED) or "dark" (very dark grey).
+  // Background colour of the bar and the popups as a hex code, #RRGGBB (e.g. #000000, pure black,
+  // ideal for OLED). The Settings popup offers dark presets and a colour picker.
   "background": "{bg}",
 
-  // Opacity of the bar background in percent, 50-100 (the Settings popup offers 100, 95, 85, 70).
-  // Text and icons always stay fully opaque.
+  // Opacity of the bar background in percent, 0-100 (0 = only text and icons are visible; the
+  // bar still reacts to the mouse). Text and icons always stay fully opaque.
   "bar_opacity": {opacity},
 
   // Hide the bar when the pointer leaves it, show it when you touch the screen edge.
@@ -447,7 +563,11 @@ fn render(c: &Config) -> String {
   "notif_prompted": {notif}
 }}
 "#,
-        opacity = c.bar_opacity,
+        opacity = c.bar_opacity.min(100),
+        icon_size = c.app_icon_size,
+        text_size = c.app_text_size,
+        tray_size = c.tray_icon_size,
+        module_size = c.module_size,
         autohide = c.autohide,
         hide_native = c.hide_native_taskbar,
         show_date = c.show_date,
@@ -487,8 +607,9 @@ pub fn init() -> Arc<Config> {
         Ok(text) => match parse(&text) {
             Ok(c) => {
                 crate::log!("config: read from {}", path.display());
-                if !text.contains(TEMPLATE_MARK) {
-                    // Legacy plain JSON: rewrite once with the commented guide.
+                if !text.contains(TEMPLATE_MARK) || text.contains("\"bar_size\"") {
+                    // Legacy plain JSON (or the legacy "bar_size", migrated by `parse`): rewrite
+                    // once with the commented guide.
                     let _w = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
                     match write_file(&c) {
                         Ok(()) => crate::log!("config: migrated to the commented format"),
@@ -723,9 +844,19 @@ impl Config {
 }
 
 impl Config {
-    /// Bar background alpha (0..=255) from `bar_opacity`, clamped to 50..=100 %.
+    /// Bar background alpha (0..=255) from `bar_opacity` (0..=100 %).
     pub fn bar_alpha(&self) -> u32 {
-        (self.bar_opacity.clamp(50, 100) as u32 * 255 + 50) / 100
+        (self.bar_opacity.min(100) as u32 * 255 + 50) / 100
+    }
+
+    /// The four sizes clamped to their ranges: (app icon px, app text px, tray icon px, module %).
+    pub fn sizes(&self) -> (u8, u8, u8, u8) {
+        (
+            APP_ICON_SIZE.clamp(self.app_icon_size),
+            APP_TEXT_SIZE.clamp(self.app_text_size),
+            TRAY_ICON_SIZE.clamp(self.tray_icon_size),
+            MODULE_SIZE.clamp(self.module_size),
+        )
     }
 }
 
@@ -832,11 +963,15 @@ mod tests {
         c.show_seconds = true;
         c.display_mode = DisplayMode::Text;
         c.position = Position::Top;
-        c.bar_size = BarSize::Large;
-        c.background = Background::Dark;
-        c.bar_opacity = 70;
+        c.app_icon_size = 24;
+        c.app_text_size = 11;
+        c.tray_icon_size = 20;
+        c.module_size = 125;
+        c.background = Background(0x2E1119);
+        c.bar_opacity = 0;
         let r = render(&c);
-        assert!(r.contains("Get-StartApps") && r.contains("\"bar_size\": \"large\""));
+        assert!(r.contains("Get-StartApps") && r.contains("\"background\": \"#2E1119\""));
+        assert!(!r.contains("\"bar_size\":"));
         assert_eq!(parse(&r).unwrap(), c);
         assert_eq!(parse(&render(&Config::default())).unwrap(), Config::default());
     }
@@ -887,10 +1022,43 @@ mod tests {
         assert_eq!(c.bar_alpha(), 242);
         c.bar_opacity = 100;
         assert_eq!(c.bar_alpha(), 255);
-        c.bar_opacity = 10;
+        c.bar_opacity = 0;
+        assert_eq!(c.bar_alpha(), 0);
+        c.bar_opacity = 50;
         assert_eq!(c.bar_alpha(), 128);
         c.bar_opacity = 200;
         assert_eq!(c.bar_alpha(), 255);
+    }
+
+    #[test]
+    fn background_values() {
+        let bg = |v: &str| parse(&format!("{{\"background\": \"{v}\", \"autohide\": false}}")).unwrap().background;
+        assert_eq!(bg("black"), Background::BLACK);
+        assert_eq!(bg("Dark"), Background::DARK);
+        assert_eq!(bg("#1a2B3c"), Background(0x1A2B3C));
+        assert_eq!(bg("#fff"), Background(0xFFFFFF));
+        // Garbage falls back to black instead of rejecting the file.
+        assert_eq!(bg("#12345"), Background::BLACK);
+        assert_eq!(bg("teal"), Background::BLACK);
+        assert_eq!(Background(0x0E1A33).hex(), "#0E1A33");
+        // Presets are dark: white text stays readable (Rec. 601 brightness below 60 / 255).
+        assert!(BACKGROUND_PRESETS.iter().all(|(_, b)| {
+            let (r, g, b) = b.rgb();
+            (r * 299 + g * 587 + b * 114) / 1000 < 60
+        }));
+    }
+
+    #[test]
+    fn legacy_bar_size_migrates() {
+        let c = parse("{\"bar_size\": \"large\"}").unwrap();
+        assert_eq!(c.sizes(), (20, 16, 20, 125));
+        assert_eq!(c.bar_size, None);
+        assert_eq!(parse("{\"bar_size\": \"small\"}").unwrap().sizes(), (14, 11, 14, 88));
+        assert_eq!(parse("{\"bar_size\": \"medium\"}").unwrap(), Config::default());
+        // New keys already set: they win.
+        assert_eq!(parse("{\"bar_size\": \"large\", \"app_icon_size\": 30}").unwrap().sizes(), (30, 13, 16, 100));
+        // Out-of-range values are clamped on use.
+        assert_eq!(parse("{\"app_icon_size\": 200, \"module_size\": 5}").unwrap().sizes(), (32, 13, 16, 75));
     }
 
     #[test]

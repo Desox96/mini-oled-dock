@@ -343,6 +343,79 @@ pub fn close_shape(u: f32, v: f32) -> bool {
     dist_seg(u, v, 4.5, 4.5, 11.5, 11.5) <= st || dist_seg(u, v, 11.5, 4.5, 4.5, 11.5) <= st
 }
 
+/// Crescent moon (Sleep): a disc with an offset disc cut out of it.
+pub fn moon_shape(u: f32, v: f32) -> bool {
+    let (dx, dy) = (u - 7.6, v - 8.4);
+    let (ex, ey) = (u - 11.0, v - 6.0);
+    dx * dx + dy * dy <= 5.6 * 5.6 && ex * ex + ey * ey > 4.6 * 4.6
+}
+
+/// Padlock (Lock): body outline, shackle arc and a keyhole dot.
+pub fn lock_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let c = ax();
+    let (l, t, r, b) = (edge(3.0), edge(7.0), edge(13.0), edge(14.0));
+    let w = 2.0 * st;
+    let outer = u >= l && u <= r && v >= t && v <= b;
+    let inner = u > l + w && u < r - w && v > t + w && v < b - w;
+    let (dx, dy) = (u - c, v - t);
+    let shackle = dy <= 0.0 && ((dx * dx + dy * dy).sqrt() - 3.0).abs() <= st;
+    let legs = dist_seg(u, v, c - 3.0, t - 3.0 + 3.0, c - 3.0, t) <= st || dist_seg(u, v, c + 3.0, t - 3.0 + 3.0, c + 3.0, t) <= st;
+    let (kx, ky) = (u - c, v - 10.5);
+    (outer && !inner) || shackle || legs || kx * kx + ky * ky <= 1.1 * 1.1
+}
+
+/// Circular arrow (Restart): ring open at the top right, arrowhead on the clockwise end.
+pub fn restart_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let c = ax();
+    let (dx, dy) = (u - c, v - 8.6);
+    let d = (dx * dx + dy * dy).sqrt();
+    let gap = dx > 0.0 && dy < 0.0 && -dy > dx * 0.4;
+    let ring = (d - 4.8).abs() <= st && !gap;
+    let head = polyline(u, v, &[(c + 0.2, 1.4), (c + 2.6, 3.8), (c + 0.2, 6.2)], st);
+    ring || head
+}
+
+/// Gear (Settings): ring with eight radial teeth.
+pub fn gear_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let c = ax();
+    let (dx, dy) = (u - c, v - snap(8.0));
+    let d = (dx * dx + dy * dy).sqrt();
+    let ring = (d - 3.2).abs() <= st;
+    let teeth = (0..8).any(|i| {
+        let a = i as f32 * std::f32::consts::FRAC_PI_4;
+        let (ca, sa) = (a.cos(), a.sin());
+        dist_seg(dx, dy, ca * 3.2, sa * 3.2, ca * 6.0, sa * 6.0) <= st + 0.2
+    });
+    ring || teeth
+}
+
+/// Startup (Start with Windows): window outline with an up arrow inside.
+pub fn startup_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let c = ax();
+    let (l, t, r, b) = (edge(2.0), edge(2.5), edge(14.0), edge(13.5));
+    let w = 2.0 * st;
+    let outer = u >= l && u <= r && v >= t && v <= b;
+    let inner = u > l + w && u < r - w && v > t + w && v < b - w;
+    let stem = dist_seg(u, v, c, 11.0, c, 6.2) <= st;
+    let head = polyline(u, v, &[(c - 2.2, 8.4), (c, 6.2), (c + 2.2, 8.4)], st);
+    (outer && !inner) || stem || head
+}
+
+/// Exit (Exit dock): open box with an arrow pointing out of it.
+pub fn exit_shape(u: f32, v: f32) -> bool {
+    let st = half();
+    let (l, t, b) = (snap(3.0), snap(3.0), snap(13.0));
+    let y = snap(8.0);
+    let frame = polyline(u, v, &[(9.0, t), (l, t), (l, b), (9.0, b)], st);
+    let arrow = dist_seg(u, v, 7.0, y, 14.0, y) <= st;
+    let head = polyline(u, v, &[(11.0, y - 3.0), (14.0, y), (11.0, y + 3.0)], st);
+    frame || arrow || head
+}
+
 /// Check mark (default audio device).
 pub fn check_shape(u: f32, v: f32) -> bool {
     polyline(u, v, &[(3.5, 8.5), (6.5, 11.5), (12.5, 4.5)], half())

@@ -10,9 +10,11 @@
 //!    evaluated with 4x4 supersampling (no resources, no icon font).
 //!
 //! Style:
-//! bar height 36 (scaled by `bar_size`, see `bar_dpi`), radius 11, background black or dark grey at
-//! `bar_opacity` (default 95 %), 1 px border RGBA(255,255,255,22), text
-//! RGBA(255,255,255,230) "Segoe UI Variable Text" 13 px (fallback "Segoe UI"), secondary text
+//! bar height 36 at the default sizes (it grows with the tallest content, see `BarSizes` and
+//! `bar_height`), radius 11, background `background` colour at `bar_opacity` (default black at 95 %,
+//! never below alpha 1 inside the pill so the bar keeps receiving the mouse), 1 px border
+//! RGBA(255,255,255,22), text RGBA(255,255,255,230) "Segoe UI Variable Text" 13 px (fallback
+//! "Segoe UI"; app names at `app_text_size`, modules scaled by `module_size`), secondary text
 //! RGBA(255,255,255,170), hover plate radius 7 (height 26, with a 1 px inner border), vertical separator 1 px wide, 16 high, RGBA(255,255,255,30),
 //! 16 px app icon centred with the name on `CONTENT_CY`, indicator: 2-high pill centred under the
 //! item content (icon and/or name): open = 50% of the content width at alpha 120, foreground = 75%
@@ -160,17 +162,88 @@ impl Metrics {
     }
 }
 
-/// DPI the bar is drawn at: the monitor DPI scaled by the configured `bar_size` (small 7/8, medium 1,
-/// large 5/4). Everything in the bar is laid out from `Metrics::px`, so height, icons (requested at the
-/// scaled size, never stretched), text and spacing stay proportional and crisp. Popups keep the monitor DPI.
-pub fn bar_dpi(monitor_dpi: u32, size: crate::config::BarSize) -> u32 {
-    use crate::config::BarSize;
-    let (num, den) = match size {
-        BarSize::Small => (7, 8),
-        BarSize::Medium => (1, 1),
-        BarSize::Large => (5, 4),
-    };
-    (monitor_dpi * num + den / 2) / den
+/// The configured sizes of the bar content (`Config::sizes`), in logical px / percent. The bar is
+/// drawn at the monitor DPI; each part is then sized on its own: app icons (requested from the shell
+/// at that exact pixel size, never stretched), app names (own font), tray icons (rescaled by the tray
+/// host), system modules (laid out at `module_metrics`: glyphs, fonts and spacing scale together).
+/// The bar height follows the tallest content (`bar_height`). The defaults reproduce the original
+/// 36 px bar exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BarSizes {
+    /// App icon side (logical px).
+    pub icon: i32,
+    /// App name font height (logical px).
+    pub text: i32,
+    /// Tray icon side (logical px).
+    pub tray: i32,
+    /// Scale of the system modules (percent).
+    pub module_pct: u32,
+    /// The names can be shown (display mode other than icon only): their height counts.
+    pub text_on: bool,
+    /// The tray is on: its icons' height counts.
+    pub tray_on: bool,
+}
+
+impl Default for BarSizes {
+    fn default() -> Self {
+        BarSizes::from_config(&crate::config::Config::default())
+    }
+}
+
+impl BarSizes {
+    /// Sizes of the config `c` (clamped to their ranges).
+    pub fn from_config(c: &crate::config::Config) -> BarSizes {
+        let (icon, text, tray, module) = c.sizes();
+        BarSizes {
+            icon: icon as i32,
+            text: text as i32,
+            tray: tray as i32,
+            module_pct: module as u32,
+            text_on: c.display_mode != DisplayMode::Icon,
+            tray_on: c.show_tray,
+        }
+    }
+
+    /// Metrics of the system modules: the bar DPI scaled by `module_pct` (100 % = the bar metrics).
+    pub fn module_metrics(self, m: Metrics) -> Metrics {
+        Metrics { dpi: ((m.dpi * self.module_pct + 50) / 100).max(1) }
+    }
+
+    /// Physical side of the app icons.
+    pub fn icon_px(self, m: Metrics) -> i32 {
+        m.px(self.icon).max(1)
+    }
+
+    /// Physical side of the tray icons.
+    pub fn tray_px(self, m: Metrics) -> i32 {
+        m.px(self.tray).max(1)
+    }
+
+    /// Visual height (logical px) of an app name of font height `text`: 16 for the default 13 px,
+    /// the same box as a default icon.
+    fn text_box(self) -> i32 {
+        (self.text * ICON_SIZE + 6) / 13
+    }
+}
+
+/// Bar height (physical px): the tallest content plus the original vertical air (10 logical px above
+/// and below a 16 px icon; the modules scale their whole 36 px band). The defaults give 36 px.
+pub fn bar_height(m: Metrics, s: BarSizes) -> i32 {
+    let air = m.px(BAR_HEIGHT) - m.px(ICON_SIZE);
+    let mut h = (s.icon_px(m) + air).max(s.module_metrics(m).px(BAR_HEIGHT));
+    if s.text_on {
+        h = h.max(m.px(s.text_box()) + air);
+    }
+    if s.tray_on {
+        h = h.max(s.tray_px(m) + air);
+    }
+    h
+}
+
+/// Centre line (physical px) of content laid out at metrics `m` in a bar `h` high: the original axis
+/// (`CONTENT_CY`) moved down by half the extra height.
+fn axis(m: Metrics, h: i32, logical_cy: i32) -> i32 {
+    m.px(logical_cy) + (h - m.px(BAR_HEIGHT)) / 2
 }
 
 impl Default for Metrics {
@@ -332,6 +405,8 @@ pub struct Plate {
 #[derive(Clone, Copy, Debug)]
 pub struct Scene<'a> {
     pub metrics: Metrics,
+    /// Content sizes (`BarSizes::from_config`); must match the ones given to `init` / `set_metrics`.
+    pub sizes: BarSizes,
     pub apps: &'a [AppView<'a>],
     /// Tray icons in registration order.
     pub tray: &'a [TrayIcon<'a>],
@@ -366,7 +441,7 @@ pub struct ItemRect {
 pub struct Layout {
     /// Bar width in physical pixels (content + padding).
     pub width: i32,
-    /// Bar height in physical pixels (`Metrics::px(BAR_HEIGHT)`).
+    /// Bar height in physical pixels (`bar_height`).
     pub height: i32,
     /// Items in visual order: apps, tray icons, chevron, then the visible system modules.
     pub items: Vec<ItemRect>,
@@ -402,9 +477,11 @@ impl Layout {
 }
 
 /// Hover plate of an item: the hit rectangle (as tall as the bar, for easy clicking) narrowed
-/// vertically by `ITEM_VMARGIN`. Square items (width 26) give a 26x26 plate.
+/// vertically by `ITEM_VMARGIN` (scaled with the bar height). Square items (width 26) give a 26x26
+/// plate at the default sizes.
 pub fn plate_rect(item: RECT, m: Metrics) -> RECT {
-    let v = m.px(ITEM_VMARGIN);
+    let base = m.px(BAR_HEIGHT).max(1);
+    let v = m.px(ITEM_VMARGIN) * (item.bottom - item.top) / base;
     RECT { left: item.left, top: item.top + v, right: item.right, bottom: item.bottom - v }
 }
 
@@ -426,11 +503,8 @@ struct Gfx {
     dc_main: HDC,
     /// DC holding the scratch DIB for text, with the font selected.
     dc_txt: HDC,
-    font: HFONT,
-    font_small: HFONT,
-    /// Line height (physical px) of the two fonts.
-    lh: i32,
-    lh_small: i32,
+    sizes: BarSizes,
+    fonts: Fonts,
     main: Option<Dib>,
     txt: Option<Dib>,
     /// Width (physical px) of the pill during the width animation; 0 = full.
@@ -439,6 +513,49 @@ struct Gfx {
 
 thread_local! {
     static GFX: RefCell<Option<Gfx>> = const { RefCell::new(None) };
+}
+
+/// Fonts of the bar: app names (`app_text_size`), module text and small module text (13 and 11 px
+/// at the module scale), with their line heights (physical px).
+struct Fonts {
+    app: HFONT,
+    module: HFONT,
+    small: HFONT,
+    lh_app: i32,
+    lh: i32,
+    lh_small: i32,
+}
+
+impl Fonts {
+    fn get(&self, t: Txt) -> (HFONT, i32) {
+        match t {
+            Txt::App => (self.app, self.lh_app),
+            Txt::Module => (self.module, self.lh),
+            Txt::Small => (self.small, self.lh_small),
+        }
+    }
+
+    fn max_lh(&self) -> i32 {
+        self.lh_app.max(self.lh).max(self.lh_small)
+    }
+
+    fn delete(&self) {
+        for f in [self.app, self.module, self.small] {
+            // SAFETY: fonts created by `build_fonts`; they are only selected temporarily, never at deletion.
+            let _ = unsafe { DeleteObject(HGDIOBJ(f.0)) };
+        }
+    }
+}
+
+/// Which bar font a text uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Txt {
+    /// App names.
+    App,
+    /// Module text (clock time, volume percentage).
+    Module,
+    /// Small module text (date, metrics).
+    Small,
 }
 
 /// Pixels of a DIB as a slice.
@@ -557,9 +674,9 @@ fn font_fallback_height() -> i32 {
 
 // ------------------------------------------------------------------ API
 
-/// Creates the GDI resources (memory DCs, Segoe UI Variable Text font -> Segoe UI fallback, at 13 px
-/// logical scaled) for the given `metrics`. The DIB is born with the first `resize`.
-pub fn init(metrics: Metrics) -> Result<(), String> {
+/// Creates the GDI resources (memory DCs, Segoe UI Variable Text fonts -> Segoe UI fallback, see
+/// `Fonts`) for the given `metrics` and `sizes`. The DIB is born with the first `resize`.
+pub fn init(metrics: Metrics, sizes: BarSizes) -> Result<(), String> {
     destroy();
     // SAFETY: the screen DC is taken and released here; the memory DCs are ours.
     let (dc_main, dc_txt) = unsafe {
@@ -586,7 +703,7 @@ pub fn init(metrics: Metrics) -> Result<(), String> {
         SetBkMode(dc_txt, TRANSPARENT);
         SetTextColor(dc_txt, COLORREF(0x00FF_FFFF));
     }
-    let (font, font_small, lh, lh_small) = match build_fonts(dc_txt, metrics) {
+    let fonts = match build_fonts(dc_txt, metrics, sizes) {
         Ok(v) => v,
         Err(e) => {
             // SAFETY: DCs created above, with no selected objects.
@@ -599,46 +716,53 @@ pub fn init(metrics: Metrics) -> Result<(), String> {
     };
     GFX.with(|c| {
         *c.borrow_mut() =
-            Some(Gfx { metrics, dc_main, dc_txt, font, font_small, lh, lh_small, main: None, txt: None, pill_w: 0 });
+            Some(Gfx { metrics, dc_main, dc_txt, sizes, fonts, main: None, txt: None, pill_w: 0 });
     });
-    log!("render::init: dpi={} font {}px line {}px", metrics.dpi, metrics.px(13), lh);
+    log!("render::init: dpi={} {sizes:?}", metrics.dpi);
     Ok(())
 }
 
-fn build_fonts(dc: HDC, m: Metrics) -> Result<(HFONT, HFONT, i32, i32), String> {
-    let font = create_font(dc, m.px(13))?;
-    let font_small = match create_font(dc, m.px(11)) {
-        Ok(f) => f,
-        Err(e) => {
-            // SAFETY: `font` was created above and is not selected.
-            let _ = unsafe { DeleteObject(HGDIOBJ(font.0)) };
-            return Err(e);
+fn build_fonts(dc: HDC, m: Metrics, s: BarSizes) -> Result<Fonts, String> {
+    let mm = s.module_metrics(m);
+    let mut made: Vec<HFONT> = Vec::with_capacity(3);
+    for px in [m.px(s.text), mm.px(13), mm.px(11)] {
+        match create_font(dc, px.max(1)) {
+            Ok(f) => made.push(f),
+            Err(e) => {
+                for f in made {
+                    // SAFETY: created above, never selected.
+                    let _ = unsafe { DeleteObject(HGDIOBJ(f.0)) };
+                }
+                return Err(e);
+            }
         }
-    };
-    let lh = line_height(dc, font);
-    let lh_small = line_height(dc, font_small);
-    Ok((font, font_small, lh, lh_small))
+    }
+    let (app, module, small) = (made[0], made[1], made[2]);
+    Ok(Fonts {
+        app,
+        module,
+        small,
+        lh_app: line_height(dc, app),
+        lh: line_height(dc, module),
+        lh_small: line_height(dc, small),
+    })
 }
 
-/// New DPI: recreates the font. The caller must then redo `layout`, `resize`, `paint`, `present`.
-pub fn set_metrics(metrics: Metrics) -> Result<(), String> {
+/// New DPI or new content sizes: recreates the fonts. The caller must then redo `layout`, `resize`,
+/// `paint`, `present`.
+pub fn set_metrics(metrics: Metrics, sizes: BarSizes) -> Result<(), String> {
     GFX.with(|c| {
         let mut b = c.borrow_mut();
         let Some(g) = b.as_mut() else { return Err("render not initialized".to_string()) };
-        if g.metrics == metrics {
+        if g.metrics == metrics && g.sizes == sizes {
             return Ok(());
         }
-        let (font, font_small, lh, lh_small) = build_fonts(g.dc_txt, metrics)?;
-        // SAFETY: the old fonts are not selected in the DCs (they are only selected temporarily).
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(g.font.0));
-            let _ = DeleteObject(HGDIOBJ(g.font_small.0));
-        }
-        g.font = font;
-        g.font_small = font_small;
-        g.lh = lh;
-        g.lh_small = lh_small;
+        let fonts = build_fonts(g.dc_txt, metrics, sizes)?;
+        // The old fonts are not selected in the DCs (they are only selected temporarily).
+        g.fonts.delete();
+        g.fonts = fonts;
         g.metrics = metrics;
+        g.sizes = sizes;
         // The DIBs depend on the DPI (height of the text DIB): they are recreated by the next `resize`.
         if let Some(d) = g.main.take() {
             free_dib(g.dc_main, d);
@@ -646,27 +770,27 @@ pub fn set_metrics(metrics: Metrics) -> Result<(), String> {
         if let Some(d) = g.txt.take() {
             free_dib(g.dc_txt, d);
         }
-        log!("render::set_metrics: dpi={} line {}px", metrics.dpi, lh);
+        log!("render::set_metrics: dpi={} {sizes:?}", metrics.dpi);
         Ok(())
     })
 }
 
-/// Width in pixels of text `s` with the normal or small font. Without `init` it estimates 7 px/char.
-fn measure(s: &str, small: bool, m: Metrics) -> i32 {
+/// Width in pixels of text `s` with font `t`. Without `init` it estimates 7 px/char (6 for `Small`).
+fn measure(s: &str, t: Txt, m: Metrics) -> i32 {
     if s.is_empty() {
         return 0;
     }
     let measured = GFX.with(|c| {
         let b = c.borrow();
         let g = b.as_ref()?;
-        Some(text_width(g, s, small))
+        Some(text_width(g, s, t))
     });
-    measured.unwrap_or_else(|| s.chars().count() as i32 * m.px(if small { 6 } else { 7 }))
+    measured.unwrap_or_else(|| s.chars().count() as i32 * m.px(if t == Txt::Small { 6 } else { 7 }))
 }
 
-fn text_width(g: &Gfx, s: &str, small: bool) -> i32 {
+fn text_width(g: &Gfx, s: &str, t: Txt) -> i32 {
     let wide: Vec<u16> = s.encode_utf16().collect();
-    let font = if small { g.font_small } else { g.font };
+    let font = g.fonts.get(t).0;
     let mut sz = SIZE::default();
     // SAFETY: `dc_txt` is valid; `wide` and `sz` outlive the call; the font is restored.
     let ok = unsafe {
@@ -694,7 +818,8 @@ struct SysWidths {
 }
 
 fn sys_widths(scene: &Scene<'_>) -> SysWidths {
-    let m = scene.metrics;
+    // The modules are laid out at their own scale.
+    let m = scene.sizes.module_metrics(scene.metrics);
     let pad = m.px(CLOCK_PAD);
     let sys = &scene.system;
     let bell = 2 * m.px(TRAY_PAD) + m.px(SYS_ICON);
@@ -702,15 +827,15 @@ fn sys_widths(scene: &Scene<'_>) -> SysWidths {
     if sys.show_volume_percent && sys.volume.available {
         // Percentage slot: two digits usually, three only at 100% (rarely changes).
         let slot = if sys.volume.level >= 100 { "100%" } else { "88%" };
-        volume += m.px(SYS_TEXT_GAP) + measure(slot, false, m);
+        volume += m.px(SYS_TEXT_GAP) + measure(slot, Txt::Module, m);
     }
-    let tw = measure(sys.time, false, m).max(measure("00:00", false, m));
-    let dw = sys.date.map(|d| measure(d, true, m)).unwrap_or(0);
+    let tw = measure(sys.time, Txt::Module, m).max(measure("00:00", Txt::Module, m));
+    let dw = sys.date.map(|d| measure(d, Txt::Small, m)).unwrap_or(0);
     let clock = 2 * pad + tw.max(dw);
     // Metrics are measured only when the module is visible.
     let metrics = if scene.modules.contains(&ItemId::Metrics) {
-        let label = measure(METRIC_LABELS[0], true, m).max(measure(METRIC_LABELS[1], true, m));
-        2 * pad + label + m.px(METRIC_GAP) + measure(metric_slot(sys.usage), true, m)
+        let label = measure(METRIC_LABELS[0], Txt::Small, m).max(measure(METRIC_LABELS[1], Txt::Small, m));
+        2 * pad + label + m.px(METRIC_GAP) + measure(metric_slot(sys.usage), Txt::Small, m)
     } else {
         0
     };
@@ -758,7 +883,7 @@ pub fn layout(scene: &Scene<'_>) -> Layout {
     let name_w: Vec<i32> = if dm == DisplayMode::Icon {
         vec![0; scene.apps.len()]
     } else {
-        scene.apps.iter().map(|a| measure(&truncate_name(a.name), false, m)).collect()
+        scene.apps.iter().map(|a| measure(&truncate_name(a.name), Txt::App, m)).collect()
     };
     let n = scene.tray.len();
     let base_vis = n;
@@ -820,17 +945,18 @@ fn build_layout(
     let m = scene.metrics;
     let pad_bar = m.px(PAD_BAR);
     let gap = m.px(ITEM_GAP);
-    let height = m.px(BAR_HEIGHT);
+    let height = bar_height(m, scene.sizes);
     // Items have full height (comfortable hit-testing); the plate narrows them (`plate_rect`).
     let top = 0;
     let bottom = height;
     let item_pad = if mode == 2 { m.px(ITEM_PAD_TIGHT) } else { m.px(ITEM_PAD) };
-    let icon = m.px(ICON_SIZE);
+    let icon = scene.sizes.icon_px(m);
     let name_gap = m.px(NAME_GAP);
     let sep_w = m.px(1).max(1);
     let zone_gap = m.px(ZONE_GAP);
-    let tray_w = 2 * m.px(TRAY_PAD) + m.px(SYS_ICON);
-    let chev_w = 2 * m.px(CHEV_PAD) + m.px(SYS_ICON);
+    let tray_px = scene.sizes.tray_px(m);
+    let tray_w = 2 * m.px(TRAY_PAD) + tray_px;
+    let chev_w = 2 * m.px(CHEV_PAD) + tray_px;
     let vis = vis.min(scene.tray.len());
     let has_chev = scene.overflow_enabled && (vis < scene.tray.len() || scene.force_chevron);
     let tray_count = vis + usize::from(has_chev);
@@ -919,7 +1045,7 @@ pub fn resize(w: i32, h: i32) -> Result<(), String> {
             free_dib(g.dc_txt, d);
         }
         let main = make_dib(g.dc_main, w, h)?;
-        let txt_h = g.lh.max(g.lh_small) + 4;
+        let txt_h = g.fonts.max_lh() + 4;
         let txt = match make_dib(g.dc_txt, w, txt_h) {
             Ok(t) => t,
             Err(e) => {
@@ -1025,10 +1151,9 @@ pub fn destroy() {
     if let Some(d) = g.txt.take() {
         free_dib(g.dc_txt, d);
     }
-    // SAFETY: objects created in `init`/`set_metrics`; none is selected in a DC any more.
+    g.fonts.delete();
+    // SAFETY: DCs created in `init`; no object of ours is selected in them any more.
     unsafe {
-        let _ = DeleteObject(HGDIOBJ(g.font.0));
-        let _ = DeleteObject(HGDIOBJ(g.font_small.0));
         let _ = DeleteDC(g.dc_main);
         let _ = DeleteDC(g.dc_txt);
     }
@@ -1100,7 +1225,9 @@ fn rr_cov(x: i32, y: i32, l: i32, t: i32, r: i32, b: i32, rad: i32) -> f32 {
 /// Bar background: `rgb` at alpha `bg_alpha` (premultiplied here; text and icons are composited over it
 /// at their own full alpha) with a white RGBA(255,255,255,22) border of `bw` px, antialiased rounded
 /// corners. Writes every pixel of `buf` (`w` x `h`): the pill is `pw` wide, starts at column `poff`,
-/// and everything outside it is zeroed.
+/// and everything outside it is zeroed. Inside the pill the alpha never drops below 1: a layered
+/// window lets the mouse through where alpha is 0, and the bar must keep its hover, clicks, drag
+/// and drop and auto-hide even at 0 % opacity.
 #[allow(clippy::too_many_arguments)]
 fn draw_bg(buf: &mut [u32], w: i32, h: i32, pw: i32, poff: i32, radius: i32, bw: i32, rgb: (u32, u32, u32), bg_alpha: u32) {
     let px = |x: i32, y: i32| -> u32 {
@@ -1109,7 +1236,7 @@ fn draw_bg(buf: &mut [u32], w: i32, h: i32, pw: i32, poff: i32, radius: i32, bw:
             return 0;
         }
         let inner = rr_cov(x, y, bw, bw, pw - bw, h - bw, radius - bw);
-        let base = argb((bg_alpha as f32 * outer + 0.5) as u32, rgb.0, rgb.1, rgb.2);
+        let base = argb(((bg_alpha as f32 * outer + 0.5) as u32).max(1), rgb.0, rgb.1, rgb.2);
         let ring = (outer - inner).max(0.0);
         let ba = (BORDER_ALPHA as f32 * ring + 0.5) as u32;
         over(base, white(ba))
@@ -1183,7 +1310,7 @@ impl Canvas<'_> {
     }
 
     /// Blends a premultiplied bitmap into the `size` x `size` square with corner `(x, y)`.
-    /// If the bitmap has a different size it is scaled nearest-neighbour (transitional case: the icon at the
+    /// If the bitmap has a different size it is scaled (averaged when shrinking, else nearest-neighbour; transitional case: the icon at the
     /// right size is arriving from the shell thread).
     fn blit(&mut self, bmp: &IconBitmap, x: i32, y: i32, size: i32, opacity: u32) {
         let (sw, sh) = (bmp.width as i32, bmp.height as i32);
@@ -1203,7 +1330,12 @@ impl Canvas<'_> {
                     continue;
                 }
                 let sx = if same { dx } else { dx * sw / size };
-                let mut s = bmp.pixels[(sy * sw + sx) as usize];
+                let mut s = if same || (sw <= size && sh <= size) {
+                    bmp.pixels[(sy * sw + sx) as usize]
+                } else {
+                    // Shrinking (e.g. tray icons kept at 16 px for the popup): average, don't skip.
+                    crate::surface::area_sample(bmp, dx, dy, size)
+                };
                 if s >> 24 == 0 {
                     continue;
                 }
@@ -1254,13 +1386,14 @@ impl Canvas<'_> {
 
 /// Draws `s` with its top-left corner at `(x, y)`: white grayscale GDI onto the black
 /// scratch DIB, then manual compositing with alpha `alpha` into the canvas.
-fn draw_text(g: &Gfx, cv: &mut Canvas<'_>, s: &str, x: i32, y: i32, small: bool, alpha: u32) {
+fn draw_text(g: &Gfx, cv: &mut Canvas<'_>, s: &str, x: i32, y: i32, t: Txt, alpha: u32) {
     let Some(txt) = g.txt.as_ref() else { return };
     if s.is_empty() {
         return;
     }
-    let w = text_width(g, s, small).min(txt.w);
-    let h = (if small { g.lh_small } else { g.lh }).min(txt.h);
+    let (font, lh) = g.fonts.get(t);
+    let w = text_width(g, s, t).min(txt.w);
+    let h = lh.min(txt.h);
     if w <= 0 || h <= 0 {
         return;
     }
@@ -1271,7 +1404,6 @@ fn draw_text(g: &Gfx, cv: &mut Canvas<'_>, s: &str, x: i32, y: i32, small: bool,
     }
     let mut wide: Vec<u16> = s.encode_utf16().collect();
     let mut rc = RECT { left: 0, top: 0, right: w, bottom: h };
-    let font = if small { g.font_small } else { g.font };
     // SAFETY: `dc_txt` has the scratch DIB selected; `wide` and `rc` outlive the call;
     // the font is restored immediately. GdiFlush guarantees GDI has written before reading.
     unsafe {
@@ -1334,8 +1466,8 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
         let rim = PLATE_RIM_ALPHA * (p.alpha as u32).min(PLATE_REF_ALPHA) / PLATE_REF_ALPHA;
         cv.stroke_rr(p.rect, pr, m.px(1).max(1), rim);
     }
-    // Separators.
-    let sh = m.px(SEP_HEIGHT);
+    // Separators (as tall, relative to the bar, as at the default height).
+    let sh = m.px(SEP_HEIGHT) * h / m.px(BAR_HEIGHT).max(1);
     for sx in [layout.separator_x, layout.separator2_x] {
         if sx >= 0 {
             let sep = rect_wh(sx, (h - sh) / 2, m.px(1).max(1), sh);
@@ -1343,11 +1475,18 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
         }
     }
 
-    let icon_px = m.px(ICON_SIZE);
-    let cy = m.px(CONTENT_CY);
+    let sizes = scene.sizes;
+    let icon_px = sizes.icon_px(m);
+    let cy = axis(m, h, CONTENT_CY);
     let pad = if layout.mode == 2 { m.px(ITEM_PAD_TIGHT) } else { m.px(ITEM_PAD) };
-    let sys_pad = m.px(TRAY_PAD);
-    let sys_icon = m.px(SYS_ICON);
+    // Tray icons and chevron: own size, bar metrics. System modules: their own metrics `mm`.
+    let tray_px = sizes.tray_px(m);
+    let mm = sizes.module_metrics(m);
+    let mcy = axis(mm, h, CONTENT_CY);
+    let sys_pad = mm.px(TRAY_PAD);
+    let sys_icon = mm.px(SYS_ICON);
+    let lh_app = g.fonts.lh_app;
+    let (lh, lh_small) = (g.fonts.lh, g.fonts.lh_small);
     let dm = crate::config::get().display_mode;
     let lift_id = scene.lift.map(|l| l.id);
     // Two passes: everything but the lifted item, then its plate and the item itself on top.
@@ -1368,7 +1507,9 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                 continue;
             }
             let r = it.rect;
+            // Module glyph corner (tray items recompute it at the tray size).
             let gx = r.left + (r.right - r.left - sys_icon) / 2;
+            let gy = mcy - sys_icon / 2;
             let hot = scene.hover == Some(it.id);
             let glyph_a = if hot { ICON_ALPHA_HOT } else { ICON_ALPHA };
             match it.id {
@@ -1394,7 +1535,7 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                     };
                     let (has_icon, has_text) = app_parts(dm, layout.mode, !name.is_empty());
                     let name_gap = m.px(NAME_GAP);
-                    let text_w = if has_text { text_width(g, &name, false) } else { 0 };
+                    let text_w = if has_text { text_width(g, &name, Txt::App) } else { 0 };
                     if has_icon {
                         match app.icon {
                             Some(b) => cv.blit(b, ix, iy, icon_px, opacity),
@@ -1406,13 +1547,17 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                     }
                     if has_text {
                         let nx = if has_icon { ix + icon_px + name_gap } else { ix };
-                        draw_text(g, &mut cv, &name, nx, cy - g.lh / 2 - label_up(m), false, text_alpha);
+                        draw_text(g, &mut cv, &name, nx, cy - lh_app / 2 - label_up(m), Txt::App, text_alpha);
                     }
                     // State bar: spans the whole visible content (icon, name or both). With the bar at the
                     // top it sits inside the pill under the icon (the bar floats EDGE_MARGIN from the screen).
                     let ih = m.px(INDICATOR_H).max(1);
                     let ty = if scene.bar_top {
-                        iy + icon_px + m.px(INDICATOR_BELOW_ICON)
+                        // Below the lower of icon and name (both centred on `cy`).
+                        let icon_half = if has_icon { icon_px - icon_px / 2 } else { 0 };
+                        let tb = m.px(sizes.text_box());
+                        let text_half = if has_text { tb - tb / 2 } else { 0 };
+                        cy + icon_half.max(text_half) + m.px(INDICATOR_BELOW_ICON)
                     } else {
                         h - m.px(INDICATOR_EDGE) - ih
                     };
@@ -1433,18 +1578,17 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                 }
                 ItemId::Tray(id) => {
                     if let Some(t) = scene.tray.iter().find(|t| t.id == id) {
-                        cv.blit(t.icon, gx, cy - sys_icon / 2, sys_icon, 255);
+                        let tx = r.left + (r.right - r.left - tray_px) / 2;
+                        cv.blit(t.icon, tx, cy - tray_px / 2, tray_px, 255);
                     }
                 }
                 ItemId::TrayOverflow => {
-                    if scene.bar_top {
-                        cv.vector(gx, cy - sys_icon / 2, sys_icon, glyph_a, &glyphs::chevron_down_shape);
-                    } else {
-                        cv.vector(gx, cy - sys_icon / 2, sys_icon, glyph_a, &glyphs::chevron_up_shape);
-                    }
+                    let tx = r.left + (r.right - r.left - tray_px) / 2;
+                    let shape: &dyn Fn(f32, f32) -> bool =
+                        if scene.bar_top { &glyphs::chevron_down_shape } else { &glyphs::chevron_up_shape };
+                    cv.vector(tx, cy - tray_px / 2, tray_px, glyph_a, shape);
                 }
                 ItemId::Notifications => {
-                    let gy = cy - sys_icon / 2;
                     let badge = scene.system.bell_badge;
                     if scene.system.bell_dnd {
                         cv.vector(gx, gy, sys_icon, glyph_a, &|u, v| glyphs::bell_off_shape(u, v, badge));
@@ -1465,7 +1609,7 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                     let waves = glyphs::waves_for(vol.level);
                     // Headphone glyph while the default device is headphones/headset (muted keeps the speaker).
                     let phones = !muted && crate::audio::default_is_headphone();
-                    cv.vector(x, cy - sys_icon / 2, sys_icon, glyph_a, &|u, v| {
+                    cv.vector(x, gy, sys_icon, glyph_a, &|u, v| {
                         if phones {
                             glyphs::device_shape(u, v, crate::audio::DeviceKind::Headphones)
                         } else {
@@ -1479,38 +1623,37 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                             g,
                             &mut cv,
                             &s,
-                            x + sys_icon + m.px(SYS_TEXT_GAP),
-                            cy - g.lh / 2 - label_up(m),
-                            false,
+                            x + sys_icon + mm.px(SYS_TEXT_GAP),
+                            mcy - lh / 2 - label_up(mm),
+                            Txt::Module,
                             a,
                         );
                     }
                 }
                 ItemId::Clock => {
                     let sys = &scene.system;
-                    let tw = text_width(g, sys.time, false);
+                    let tw = text_width(g, sys.time, Txt::Module);
                     let cxm = (r.left + r.right) / 2;
                     match sys.date {
                         Some(d) if !d.is_empty() => {
-                            let dw = text_width(g, d, true);
-                            let total = g.lh + g.lh_small - m.px(2);
-                            let y0 = m.px(CLOCK_CY) - total / 2 - m.px(CLOCK_UP_HALVES) / 2;
+                            let dw = text_width(g, d, Txt::Small);
+                            let total = lh + lh_small - mm.px(2);
+                            let y0 = axis(mm, h, CLOCK_CY) - total / 2 - mm.px(CLOCK_UP_HALVES) / 2;
                             let (ta, da) =
                                 if hot { (TEXT_ALPHA_HOT, TEXT2_ALPHA_HOT) } else { (TEXT_ALPHA, TEXT2_ALPHA) };
-                            draw_text(g, &mut cv, sys.time, cxm - tw / 2, y0, false, ta);
-                            draw_text(g, &mut cv, d, cxm - dw / 2, y0 + g.lh - m.px(2), true, da);
+                            draw_text(g, &mut cv, sys.time, cxm - tw / 2, y0, Txt::Module, ta);
+                            draw_text(g, &mut cv, d, cxm - dw / 2, y0 + lh - mm.px(2), Txt::Small, da);
                         }
                         _ => {
                             let ta = if hot { TEXT_ALPHA_HOT } else { TEXT_ALPHA };
-                            draw_text(g, &mut cv, sys.time, cxm - tw / 2, cy - g.lh / 2, false, ta)
+                            draw_text(g, &mut cv, sys.time, cxm - tw / 2, mcy - lh / 2, Txt::Module, ta)
                         }
                     }
                 }
-                ItemId::ShowDesktop => cv.vector(gx, cy - sys_icon / 2, sys_icon, glyph_a, &glyphs::show_desktop_shape),
-                ItemId::Power => cv.vector(gx, cy - sys_icon / 2, sys_icon, glyph_a, &glyphs::power_shape),
+                ItemId::ShowDesktop => cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::show_desktop_shape),
+                ItemId::Power => cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::power_shape),
                 ItemId::Network => {
                     let net = scene.system.net;
-                    let gy = cy - sys_icon / 2;
                     if net.kind == NetKind::Ethernet {
                         cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::ethernet_shape);
                     } else {
@@ -1526,17 +1669,17 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                 }
                 ItemId::Metrics => {
                     let u = scene.system.usage;
-                    let step = g.lh_small - m.px(2);
-                    let y0 = m.px(CLOCK_CY) - (step + g.lh_small) / 2 - m.px(CLOCK_UP_HALVES) / 2;
-                    let pad = m.px(CLOCK_PAD);
+                    let step = lh_small - mm.px(2);
+                    let y0 = axis(mm, h, CLOCK_CY) - (step + lh_small) / 2 - mm.px(CLOCK_UP_HALVES) / 2;
+                    let pad = mm.px(CLOCK_PAD);
                     let (la, va) = if hot { (TEXT2_ALPHA, TEXT_ALPHA_HOT) } else { (METRIC_LABEL_ALPHA, TEXT_ALPHA) };
                     for (k, val) in [u.cpu, u.ram].into_iter().enumerate() {
                         let y = y0 + k as i32 * step;
-                        draw_text(g, &mut cv, METRIC_LABELS[k], r.left + pad, y, true, la);
+                        draw_text(g, &mut cv, METRIC_LABELS[k], r.left + pad, y, Txt::Small, la);
                         // Values right-aligned on the item padding.
                         let s = format!("{val}%");
-                        let vw = text_width(g, &s, true);
-                        draw_text(g, &mut cv, &s, r.right - pad - vw, y, true, va);
+                        let vw = text_width(g, &s, Txt::Small);
+                        draw_text(g, &mut cv, &s, r.right - pad - vw, y, Txt::Small, va);
                     }
                 }
             }
@@ -1559,4 +1702,57 @@ pub(crate) fn snapshot_pixels() -> Option<(i32, i32, Vec<u32>)> {
         let d = b.as_ref()?.main.as_ref()?;
         Some((d.w, d.h, dib_pixels(d).to_vec()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transparent_bar_keeps_the_mouse() {
+        // 0 % opacity: every pixel of the pill keeps alpha >= 1 (a layered window is click-through
+        // where alpha is 0), everything outside it stays fully transparent.
+        let (w, h, pw, poff) = (60, 20, 50, 5);
+        let mut buf = vec![0u32; (w * h) as usize];
+        draw_bg(&mut buf, w, h, pw, poff, 6, 1, (0, 0, 0), 0);
+        for y in 0..h {
+            for x in 0..w {
+                let a = buf[(y * w + x) as usize] >> 24;
+                let inside = rr_cov(x - poff, y, 0, 0, pw, h, 6) > 0.0;
+                assert_eq!(a > 0, inside, "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn default_sizes_keep_the_original_bar() {
+        let s = BarSizes::default();
+        for dpi in [96, 120, 144, 168, 192] {
+            let m = Metrics { dpi };
+            assert_eq!(bar_height(m, s), m.px(BAR_HEIGHT));
+            assert_eq!(s.module_metrics(m), m);
+            assert_eq!(s.icon_px(m), m.px(ICON_SIZE));
+            assert_eq!(s.tray_px(m), m.px(SYS_ICON));
+            assert_eq!(axis(m, bar_height(m, s), CONTENT_CY), m.px(CONTENT_CY));
+        }
+    }
+
+    #[test]
+    fn bar_grows_with_the_tallest_content() {
+        let m = Metrics { dpi: 96 };
+        let big = BarSizes { icon: 32, ..BarSizes::default() };
+        assert_eq!(bar_height(m, big), 52);
+        let modules = BarSizes { module_pct: 150, ..BarSizes::default() };
+        assert_eq!(bar_height(m, modules), 54);
+        // Text only counts when names can be shown; the tray only when it is on.
+        let text = BarSizes { text: 18, ..BarSizes::default() };
+        assert!(bar_height(m, text) > 36);
+        assert_eq!(bar_height(m, BarSizes { text_on: false, ..text }), 36);
+        let tray = BarSizes { tray: 24, ..BarSizes::default() };
+        assert_eq!(bar_height(m, tray), 44);
+        assert_eq!(bar_height(m, BarSizes { tray_on: false, ..tray }), 36);
+        // Smaller content gives a slimmer bar.
+        let small = BarSizes { icon: 14, text: 10, tray: 12, module_pct: 75, ..BarSizes::default() };
+        assert_eq!(bar_height(m, small), 34);
+    }
 }

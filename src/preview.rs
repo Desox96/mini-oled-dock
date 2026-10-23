@@ -10,7 +10,8 @@
 //! Errors go to stderr (the async logger is not started in this mode).
 //!
 //! HOOKs used in other people's files (marked `PREVIEW-HOOK`): `render::snapshot_pixels`,
-//! `Surface::snapshot_pixels`, `notif::preview_set_state`, `popup_tray::preview_new`.
+//! `Surface::snapshot_pixels`, `notif::preview_set_state`, `popup_tray::preview_new`,
+//! `popup_settings::preview_new`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -18,21 +19,26 @@ use std::sync::Arc;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 use crate::audio::{DeviceKind, OutputDevice, VolumeState};
-use crate::config::{Background, BarSize, Config, DisplayMode};
+use crate::config::{Background, Config, DisplayMode};
 use crate::icons::{self, IconBitmap};
 use crate::metrics::Usage;
 use crate::net::{NetInfo, NetKind, NetStatus};
 use crate::notif::{self, NotifAccess, NotifItem, NotifState};
 use crate::popup::{Content, DataEvent};
-use crate::render::{self, AppView, Indicator, ItemId, Lift, Metrics, Plate, Scene, SystemView, TrayIcon};
+use crate::popup_settings::Page;
+use crate::render::{self, AppView, BarSizes, Indicator, ItemId, Lift, Metrics, Plate, Scene, SystemView, TrayIcon};
 use crate::surface::Surface;
 
 thread_local! {
-    /// Bar style of the next `render_bar` (size, background, opacity %): the defaults except for the
-    /// style variants.
-    static STYLE: std::cell::Cell<(BarSize, Background, u8)> =
-        const { std::cell::Cell::new((BarSize::Medium, Background::Black, 95)) };
+    /// Bar style of the next `render_bar` (sizes, background, opacity): applied to the config of the
+    /// bar; a no-op except for the style variants.
+    static STYLE: std::cell::Cell<Style> = const { std::cell::Cell::new(no_style) };
 }
+
+/// A bar style variant: edits the config the bar is drawn with.
+type Style = fn(&mut Config);
+
+fn no_style(_: &mut Config) {}
 
 /// Rendered DPIs and file suffix (120 is the "main" file).
 const DPIS: [(u32, &str); 2] = [(120, ""), (96, "_96")];
@@ -210,10 +216,12 @@ const TRAY_BAR: usize = 6;
 const TRAY_NAMES: [&str; 9] =
     ["Teams", "Slack", "OneDrive", "Bluetooth", "NVIDIA", "Wi-Fi", "Cloud Sync", "Mail", "Printer"];
 
-fn mock_icons(m: Metrics) -> MockIcons {
+/// Mock icons at the sizes `s` (app and tray icons at their exact pixel size, like the shell
+/// thread and the tray host deliver them).
+fn mock_icons(m: Metrics, s: BarSizes) -> MockIcons {
     MockIcons {
-        apps: APPS.iter().map(|a| mock_icon(a.1, a.2, m.px(render::ICON_SIZE))).collect(),
-        tray: TRAY.iter().map(|t| mock_icon(t.0, t.1, m.px(16))).collect(),
+        apps: APPS.iter().map(|a| mock_icon(a.1, a.2, s.icon_px(m))).collect(),
+        tray: TRAY.iter().map(|t| mock_icon(t.0, t.1, s.tray_px(m))).collect(),
     }
 }
 
@@ -307,17 +315,16 @@ fn render_bar(
 ) -> Option<(i32, i32, Vec<u32>)> {
     // The renderer reads the display mode from the global config snapshot (in memory only, never saved).
     // The metrics module (off by default) is switched on so the preview shows every module.
-    let (bar_size, background, bar_opacity) = STYLE.with(|s| s.get());
-    let cfg = Config { display_mode: mode, show_metrics: true, bar_size, background, bar_opacity, ..Config::default() };
-    // The bar is drawn at the monitor DPI scaled by `bar_size`, exactly like `ui`.
-    let m = Metrics { dpi: render::bar_dpi(m.dpi, bar_size) };
+    let mut cfg = Config { display_mode: mode, show_metrics: true, ..Config::default() };
+    STYLE.with(|s| s.get())(&mut cfg);
+    let sizes = BarSizes::from_config(&cfg);
     let modules = render::visible_modules(&cfg);
     crate::config::set(cfg);
-    if let Err(e) = render::init(m) {
+    if let Err(e) = render::init(m, sizes) {
         eprintln!("preview: render::init failed: {e}");
         return None;
     }
-    let ic = mock_icons(m);
+    let ic = mock_icons(m, sizes);
     let views: Vec<AppView<'_>> = APPS
         .iter()
         .zip(&ic.apps)
@@ -334,6 +341,7 @@ fn render_bar(
         ic.tray.iter().enumerate().take(TRAY_BAR).map(|(i, bmp)| TrayIcon { id: i as u64 + 1, icon: bmp }).collect();
     let mut scene = Scene {
         metrics: m,
+        sizes,
         apps: &views,
         tray: &tray,
         overflow_enabled: true,
@@ -473,16 +481,27 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
         }),
         "popup_power" => crate::popup_power::new(),
         "popup_settings" => crate::popup_settings::new(),
-        "popup_settings_dark" => {
+        "popup_settings_navy" => {
             crate::config::set(Config {
-                background: Background::Dark,
-                bar_size: BarSize::Large,
-                bar_opacity: 85,
+                background: Background(0x0E1A33),
+                bar_opacity: 80,
                 show_metrics: true,
                 autohide: false,
                 ..Config::default()
             });
             crate::popup_settings::new()
+        }
+        "popup_settings_background" => {
+            crate::config::set(Config { background: Background(0x2A1F3D), bar_opacity: 60, ..Config::default() });
+            crate::popup_settings::preview_new(Page::Background, true)
+        }
+        "popup_settings_presets" => {
+            crate::config::set(Config { background: Background(0x1A222D), ..Config::default() });
+            crate::popup_settings::preview_new(Page::Background, false)
+        }
+        "popup_settings_sizes" => {
+            crate::config::set(Config { app_icon_size: 24, module_size: 125, ..Config::default() });
+            crate::popup_settings::preview_new(Page::Sizes, false)
         }
         "popup_app" => crate::popup::popup_app::new(crate::popup::AppMenuInfo {
             key: "discord".to_string(),
@@ -492,7 +511,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             can_launch: true,
         }),
         "popup_tray" | "popup_tray_customize" => {
-            let ic = mock_icons(m);
+            let ic = mock_icons(m, BarSizes::default());
             let bmps: Vec<Arc<IconBitmap>> = ic.tray.into_iter().map(Arc::new).collect();
             let cells = bmps.iter().enumerate().skip(TRAY_BAR).map(|(i, b)| (i as u64 + 1, Some(b.clone()))).collect();
             // Chooser list: all apps sorted by name; the last 3 are hidden from the bar.
@@ -585,12 +604,29 @@ pub fn run(dir: &str) -> i32 {
                 net,
             ));
         }
-        // Style variants: small and large bar, dark grey background at 70 % opacity.
-        for (name, style) in [
-            ("bar_size_small", (BarSize::Small, Background::Black, 95)),
-            ("bar_size_large", (BarSize::Large, Background::Black, 95)),
-            ("bar_dark_70", (BarSize::Medium, Background::Dark, 70)),
-        ] {
+        // Style variants: transparent background, coloured background, independent sizes.
+        let styles: [(&str, Style); 5] = [
+            ("bar_opacity_0", |c| c.bar_opacity = 0),
+            ("bar_colour", |c| {
+                c.background = Background(0x261630);
+                c.bar_opacity = 90;
+            }),
+            ("bar_big_icons", |c| {
+                c.app_icon_size = 28;
+                c.app_text_size = 11;
+            }),
+            ("bar_big_modules", |c| {
+                c.module_size = 150;
+                c.tray_icon_size = 22;
+            }),
+            ("bar_sizes_small", |c| {
+                c.app_icon_size = 14;
+                c.app_text_size = 10;
+                c.tray_icon_size = 12;
+                c.module_size = 75;
+            }),
+        ];
+        for (name, style) in styles {
             STYLE.with(|s| s.set(style));
             failures += i32::from(!bar_png(
                 dir,
@@ -602,7 +638,7 @@ pub fn run(dir: &str) -> i32 {
                 false,
                 wifi,
             ));
-            STYLE.with(|s| s.set((BarSize::Medium, Background::Black, 95)));
+            STYLE.with(|s| s.set(no_style));
         }
         failures += i32::from(!bar_png(
             dir,
@@ -623,7 +659,10 @@ pub fn run(dir: &str) -> i32 {
             ("popup_network_offline", 9),
             ("popup_power", 4),
             ("popup_settings", 3),
-            ("popup_settings_dark", 14),
+            ("popup_settings_navy", 2),
+            ("popup_settings_background", 4),
+            ("popup_settings_presets", 3),
+            ("popup_settings_sizes", 5),
             ("popup_app", 1),
             ("popup_tray", 1),
             ("popup_tray_customize", 2),

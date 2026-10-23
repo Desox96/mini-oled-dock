@@ -276,7 +276,7 @@ pub(crate) trait Content {
     fn drag(&mut self, _id: u32, _x: i32, _y: i32) -> Reply {
         Reply::None
     }
-    /// 1 s tick (`TIMER_POPUP_TICK`).
+    /// 1 s tick (`TIMER_POPUP_TICK`); also fired early by `popup::tick_soon`.
     fn tick(&mut self) -> Reply {
         Reply::None
     }
@@ -463,12 +463,14 @@ pub fn current() -> Option<PopupKind> {
 }
 
 /// The bar moved or resized (config change) while a popup is open: re-anchors it to `anchor` (the
-/// same item's new rectangle). Called by `ui`.
+/// same item's new rectangle). Called by `ui`. While the left button is held (a Settings slider or
+/// the colour picker being dragged) the popup stays put, so the control does not slide away under
+/// the pointer: the new anchor is used by the next relayout (the release saves and re-applies).
 pub fn reanchor(anchor: Anchor) {
     let moved = with(|st| match st.open.as_mut() {
         Some(o) => {
             o.anchor = anchor;
-            true
+            o.pressed.is_none()
         }
         None => false,
     });
@@ -684,6 +686,7 @@ fn ensure_window() -> Option<HWND> {
     match r {
         Ok(h) => {
             with(|st| st.hwnd = h);
+            POPUP_HWND.store(h.0 as isize, std::sync::atomic::Ordering::Relaxed);
             Some(h)
         }
         Err(e) => {
@@ -1175,7 +1178,27 @@ fn on_anim(hwnd: HWND) {
     }
 }
 
+/// The popup window (0 = none), readable while the state is borrowed.
+static POPUP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Fires the content's `tick` once after about `ms` (re-arms the 1 s tick timer, which `close_inner`
+/// kills, so nothing outlives the popup). Only meaningful while a popup is open.
+pub(crate) fn tick_soon(ms: u32) {
+    let h = POPUP_HWND.load(std::sync::atomic::Ordering::Relaxed);
+    if h != 0 {
+        // SAFETY: the window belongs to this thread; a stale handle just makes the call fail.
+        unsafe {
+            SetTimer(Some(HWND(h as *mut _)), TIMER_POPUP_TICK, ms.max(10), None);
+        }
+    }
+}
+
 fn on_tick(hwnd: HWND) {
+    // Back to the regular 1 s period (a `tick_soon` may have shortened it).
+    // SAFETY: `hwnd` is our window.
+    unsafe {
+        SetTimer(Some(hwnd), TIMER_POPUP_TICK, 1000, None);
+    }
     let r = with(|st| {
         let o = st.open.as_mut()?;
         Some((o.content.tick(), o.was_active, o.fg_at_open))

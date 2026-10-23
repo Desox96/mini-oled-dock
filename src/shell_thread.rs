@@ -955,9 +955,12 @@ fn resolve_icon(r: &ResolveApp) -> Option<IconBitmap> {
     // 2. Disk cache (64 px master), invalidated by the exe's mtime.
     let exe_ok = is_usable_exe(&r.exe_path);
     let exe_mtime = if exe_ok { icons::file_mtime(Path::new(&r.exe_path)) } else { None };
-    if let Some(m) = icons::cache_load(&r.key, exe_mtime) {
-        if let Some(b) = nonempty(icons::resize_area(&m, px)) {
-            return Some(b);
+    // Only for sizes the master covers: beyond it the original source is used (below), never a stretched copy.
+    if px <= MASTER_PX {
+        if let Some(m) = icons::cache_load(&r.key, exe_mtime) {
+            if let Some(b) = nonempty(icons::resize_area(&m, px)) {
+                return Some(b);
+            }
         }
     }
 

@@ -8,7 +8,7 @@
 //! RESPONSIBILITIES
 //!  * Builds the item list: pinned apps first (`config.pinned` order), then unpinned
 //!    `apps::groups()` by `first_seen`. For every new key it sends
-//!    `ShellRequest::ResolveApp` (name + icon at `Metrics::px(ICON_SIZE)`); on DPI change it redoes the icon requests.
+//!    `ShellRequest::ResolveApp` (name + icon at `BarSizes::icon_px`); on a DPI or icon size change it redoes the icon requests.
 //!  * Every `redraw()`: builds a `render::Scene`, calls `render::layout`, recomputes the geometry
 //!    (bar horizontally centered, width = `layout.width`), `render::resize` if the size
 //!    changes, `render::paint`, `render::present`.
@@ -74,7 +74,9 @@ use crate::msg::{
     TIMER_POLL, TIMER_RECONCILE, TIMER_SYSMON, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD, WM_DOCK_SHELL_READY, WM_DOCK_VOLUME,
 };
 use crate::popup::{self, Anchor, AppMenuInfo, PopupKind};
-use crate::render::{AppView, Indicator, ItemId, ItemRect, Layout, Lift, Metrics, Plate, Scene, SystemView, TrayIcon};
+use crate::render::{
+    AppView, BarSizes, Indicator, ItemId, ItemRect, Layout, Lift, Metrics, Plate, Scene, SystemView, TrayIcon,
+};
 use crate::shell_thread::{self, ResolveApp, ShellEvent, ShellRequest};
 use crate::tray_host::{self, TrayClick, TrayGeometry, TrayView};
 use crate::{hook, hwnd, render};
@@ -287,9 +289,11 @@ struct UiState {
     /// Width of the displayed pill (physical px; 0 = never drawn).
     shown_w: i32,
     wanim: WidthAnim,
-    /// Bar metrics: monitor DPI scaled by `bar_size` (`render::bar_dpi`).
+    /// Bar metrics: the monitor DPI.
     metrics: Metrics,
-    /// Effective DPI of the bar's monitor (popups use it: they do not follow `bar_size`).
+    /// Content sizes of the bar (`render::BarSizes::from_config`).
+    sizes: BarSizes,
+    /// Effective DPI of the bar's monitor (the popups use it).
     monitor_dpi: u32,
     entries: Vec<Entry>,
     layout: Layout,
@@ -363,14 +367,15 @@ fn now_ms() -> u64 {
 /// (centered bar, provisional width). Returns the `Geom` to create the window with.
 /// Called by `main::run` after `config::init()`.
 pub fn init() -> Result<Geom, String> {
-    let mon = primary_dpi();
-    let dpi = render::bar_dpi(mon, config::get().bar_size);
+    let dpi = primary_dpi();
+    let sizes = BarSizes::from_config(&config::get());
     UI.with(|u| {
         let st = &mut *u.borrow_mut();
         st.metrics = Metrics { dpi };
-        st.monitor_dpi = mon;
+        st.sizes = sizes;
+        st.monitor_dpi = dpi;
     });
-    let g = compute_geom(config_top(), Metrics { dpi }.px(DEFAULT_BAR_WIDTH), dpi)?;
+    let g = compute_geom(config_top(), Metrics { dpi }.px(DEFAULT_BAR_WIDTH), dpi, sizes)?;
     GEOM.with(|c| c.set(Some(g)));
     log!(
         "initial geometry: x={} y={} w={} h={} dpi={dpi} (monitor {}x{})",
@@ -389,12 +394,15 @@ pub fn init() -> Result<Geom, String> {
 /// first `redraw`, and initial visibility of `SHOW_MS_STARTUP` ms (always visible if
 /// `!config::effective_autohide()`). Also installs `apps::install_winevent_hook`.
 pub fn attach(h: HWND) -> Result<(), String> {
-    let metrics = UI.with(|u| u.borrow().metrics);
-    render::init(metrics)?;
+    let (metrics, sizes) = UI.with(|u| {
+        let st = u.borrow();
+        (st.metrics, st.sizes)
+    });
+    render::init(metrics, sizes)?;
     if let Err(e) = apps::install_winevent_hook() {
         log!("ui::attach: apps WinEventHook not installed: {e}");
     }
-    tray_host::set_icon_px(metrics.px(16).max(1) as u32);
+    tray_host::set_icon_px((sizes.tray_px(metrics)).max(metrics.px(16)) as u32);
     refresh_tray_state();
     apps::refresh(h);
     rebuild_entries();
@@ -564,12 +572,13 @@ pub fn toggle() {
 /// (pins/names), rereads position/auto-hide and redraws.
 pub fn on_config_changed() {
     log!("ui::on_config_changed: rebuilding items and geometry");
-    // `bar_size` changed: same path as a DPI change (fonts, icons at the new size, geometry).
+    // Sizes (or what makes them count: display mode, tray) changed: same path as a DPI change
+    // (fonts, icons at the new size, geometry).
     let (mon, cur) = UI.with(|u| {
         let st = u.borrow();
-        (st.monitor_dpi, st.metrics.dpi)
+        (st.monitor_dpi, st.sizes)
     });
-    if mon >= 96 && render::bar_dpi(mon, config::get().bar_size) != cur {
+    if mon >= 96 && BarSizes::from_config(&config::get()) != cur {
         apply_dpi(mon);
     }
     // Volume / notification modules switched: create or release their threads and COM objects.
@@ -792,7 +801,10 @@ pub fn redraw() {
     let clock = crate::clock::format_now();
     let cfg = config::get();
     let top = config_top();
-    let dpi = UI.with(|u| u.borrow().metrics.dpi);
+    let (dpi, sizes) = UI.with(|u| {
+        let st = u.borrow();
+        (st.metrics.dpi, st.sizes)
+    });
     let mi = match primary_monitor() {
         Ok(mi) => mi,
         Err(e) => {
@@ -841,6 +853,7 @@ pub fn redraw() {
             st.tray.iter().filter_map(|t| t.bitmap.as_deref().map(|b| TrayIcon { id: t.id, icon: b })).collect();
         let mut scene = Scene {
             metrics: m,
+            sizes,
             apps: &views,
             tray: &tray_icons,
             overflow_enabled: popup::is_available(),
@@ -936,7 +949,7 @@ pub fn redraw() {
     }
     let Some(layout) = layout else { return };
     // Geometry: bar centered on the work area, width = layout.width.
-    let mut g = match geom_from(&mi, top, layout.width, dpi) {
+    let mut g = match geom_from(&mi, top, layout.width, dpi, sizes) {
         Ok(g) => g,
         Err(e) => {
             log!("redraw: {e}");
@@ -1233,7 +1246,7 @@ fn request_missing() {
     let ready = shell_thread::thread_id() != 0;
     UI.with(|u| {
         let st = &mut *u.borrow_mut();
-        let px = st.metrics.px(render::ICON_SIZE).max(1) as u32;
+        let px = st.sizes.icon_px(st.metrics) as u32;
         let mut pending = false;
         for e in st.entries.iter_mut() {
             if e.req_px == px {
@@ -1264,7 +1277,7 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
     }
     UI.with(|u| {
         let st = &mut *u.borrow_mut();
-        let px = st.metrics.px(render::ICON_SIZE).max(1) as u32;
+        let px = st.sizes.icon_px(st.metrics) as u32;
         match ev {
             ShellEvent::AppName { key, name } => {
                 let Some(e) = st.entries.iter_mut().find(|e| same_key(&e.key, &key)) else { return false };
@@ -1320,26 +1333,30 @@ fn refresh_apps() {
     }
 }
 
-/// New monitor DPI (or monitor change, or `bar_size` change): metrics, fonts, icon requests, geometry.
+/// New monitor DPI (or monitor change, or sizes change): metrics, fonts, icon requests, geometry.
 fn apply_dpi(mon: u32) {
-    let dpi = render::bar_dpi(mon, config::get().bar_size);
+    let dpi = mon;
     let m = Metrics { dpi };
+    let sizes = BarSizes::from_config(&config::get());
     let changed = UI.with(|u| {
         let st = &mut *u.borrow_mut();
         st.monitor_dpi = mon;
-        if st.metrics == m {
+        if st.metrics == m && st.sizes == sizes {
             return false;
         }
-        st.metrics = m;
-        for e in &mut st.entries {
-            e.req_px = 0; // icons must be redone at the new size (the old one stays meanwhile)
+        if sizes.icon_px(m) != st.sizes.icon_px(st.metrics) {
+            for e in &mut st.entries {
+                e.req_px = 0; // icons must be redone at the new size (the old one stays meanwhile)
+            }
         }
+        st.metrics = m;
+        st.sizes = sizes;
         true
     });
     if changed {
-        log!("DPI -> {dpi}");
-        tray_host::set_icon_px(m.px(16).max(1) as u32);
-        if let Err(e) = render::set_metrics(m) {
+        log!("DPI -> {dpi}, {sizes:?}");
+        tray_host::set_icon_px((sizes.tray_px(m)).max(m.px(16)) as u32);
+        if let Err(e) = render::set_metrics(m, sizes) {
             log!("render::set_metrics failed: {e}");
         }
         request_missing();
@@ -2291,15 +2308,15 @@ fn primary_monitor() -> Result<MONITORINFO, String> {
 }
 
 /// Geometry: bar of `bar_w` physical px, horizontally centered on the primary monitor's
-/// work area, `BAR_HEIGHT` logical tall, `EDGE_MARGIN` logical from the edge (bottom or top).
-fn compute_geom(top: bool, bar_w: i32, dpi: u32) -> Result<Geom, String> {
-    geom_from(&primary_monitor()?, top, bar_w, dpi)
+/// work area, `render::bar_height` tall, `EDGE_MARGIN` logical from the edge (bottom or top).
+fn compute_geom(top: bool, bar_w: i32, dpi: u32, sizes: BarSizes) -> Result<Geom, String> {
+    geom_from(&primary_monitor()?, top, bar_w, dpi, sizes)
 }
 
-fn geom_from(mi: &MONITORINFO, top: bool, bar_w: i32, dpi: u32) -> Result<Geom, String> {
+fn geom_from(mi: &MONITORINFO, top: bool, bar_w: i32, dpi: u32, sizes: BarSizes) -> Result<Geom, String> {
     let m = Metrics { dpi };
     let wa = mi.rcWork;
-    let h = m.px(render::BAR_HEIGHT);
+    let h = render::bar_height(m, sizes);
     let margin = m.px(render::EDGE_MARGIN);
     let w = bar_w.min(wa.right - wa.left - 2 * margin);
     if w < 100 {

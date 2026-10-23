@@ -5,6 +5,7 @@
 use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
 use std::sync::Arc;
 
+use crate::glyphs;
 use crate::log;
 use crate::popup::{center_y, hline, lift, row_plate, toggle_switch, Content, HitMap, PopupKind, Reply};
 use crate::power::{self, PowerAction};
@@ -81,7 +82,7 @@ impl Content for PowerPopup {
     fn size(&mut self, s: &Surface) -> (i32, i32) {
         let m = s.metrics();
         let (inset, row) = (m.px(8), m.px(34));
-        let w = m.px(220);
+        let w = m.px(244);
         self.width = w;
         self.pad_text = m.px(12);
         self.hits.clear();
@@ -111,7 +112,20 @@ impl Content for PowerPopup {
             let (txt, alpha) = if id == ID_EXIT { (label(id), TEXT2_ALPHA) } else { (label(id), TEXT_ALPHA) };
             let font = Font::Normal;
             let y = center_y(&rc, s.line_height(font));
-            s.text(txt, rc.left + self.pad_text, y, font, WHITE, lift(alpha, h));
+            // Icon in a 16 px slot at the text column, label after it (same alignment as the audio devices).
+            let m = s.metrics();
+            let icon = m.px(16);
+            let shape: fn(f32, f32) -> bool = match id {
+                ID_SLEEP => glyphs::moon_shape,
+                ID_LOCK => glyphs::lock_shape,
+                ID_RESTART => glyphs::restart_shape,
+                ID_SHUTDOWN => glyphs::power_shape,
+                ID_SETTINGS => glyphs::gear_shape,
+                ID_AUTOSTART => glyphs::startup_shape,
+                _ => glyphs::exit_shape,
+            };
+            s.glyph(rc.left + self.pad_text, rc.top + ((rc.bottom - rc.top) - icon) / 2, icon, lift(alpha, h), &shape);
+            s.text(txt, rc.left + self.pad_text + icon + m.px(8), y, font, WHITE, lift(alpha, h));
             if id == ID_SETTINGS {
                 let cw = s.text_width("\u{203A}", font);
                 s.text("\u{203A}", rc.right - self.pad_text - cw, y, font, WHITE, lift(TEXT3_ALPHA, h));

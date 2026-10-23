@@ -432,7 +432,28 @@ impl Surface {
         self.stroke_rr(rc, radius, bw, rim);
     }
 
-    /// Blend of a premultiplied bitmap into the `size` square (nearest scaling if different).
+    /// Opaque fill of the rounded rectangle `rc` (AA corners, `radius` physical px) with a colour
+    /// computed per pixel by `color(x, y)` (client coordinates): colour picker surfaces and swatches.
+    pub fn fill_fn(&mut self, rc: RECT, radius: i32, color: &dyn Fn(i32, i32) -> (u32, u32, u32)) {
+        let Some(main) = self.main.as_ref() else { return };
+        let (w, h) = (main.w, main.h);
+        let buf = dib_pixels(main);
+        let clip = self.clip;
+        for y in rc.top.max(0)..rc.bottom.min(h) {
+            for x in rc.left.max(0)..rc.right.min(w) {
+                let cov = rr_cov(x, y, rc.left, rc.top, rc.right, rc.bottom, radius);
+                let a = (255.0 * cov + 0.5) as u32;
+                if a > 0 {
+                    let (r, g, b) = color(x, y);
+                    Self::blend(buf, w, h, clip, x, y, argb(a, r.min(255), g.min(255), b.min(255)));
+                }
+            }
+        }
+    }
+
+    /// Blend of a premultiplied bitmap into the `size` square. A different size is scaled: area
+    /// average when shrinking (stays crisp, e.g. tray icons rendered for a larger bar), nearest
+    /// when enlarging.
     pub fn blit(&mut self, bmp: &IconBitmap, x: i32, y: i32, size: i32, opacity: u32) {
         let Some(main) = self.main.as_ref() else { return };
         let (w, h) = (main.w, main.h);
@@ -455,7 +476,11 @@ impl Surface {
                     continue;
                 }
                 let sx = if same { dx } else { dx * sw / size };
-                let mut s = bmp.pixels[(sy * sw + sx) as usize];
+                let mut s = if same || (sw <= size && sh <= size) {
+                    bmp.pixels[(sy * sw + sx) as usize]
+                } else {
+                    area_sample(bmp, dx, dy, size)
+                };
                 if s >> 24 == 0 {
                     continue;
                 }
@@ -726,6 +751,25 @@ fn rr_cov(x: i32, y: i32, l: i32, t: i32, r: i32, b: i32, rad: i32) -> f32 {
 }
 
 /// `RECT` from origin and size.
+/// Average (premultiplied) of the source pixels covered by destination pixel `(dx, dy)` of a
+/// `size` x `size` image drawn from `bmp`.
+pub(crate) fn area_sample(bmp: &IconBitmap, dx: i32, dy: i32, size: i32) -> u32 {
+    let (sw, sh) = (bmp.width as i32, bmp.height as i32);
+    let (x0, x1) = (dx * sw / size, ((dx + 1) * sw / size).max(dx * sw / size + 1).min(sw));
+    let (y0, y1) = (dy * sh / size, ((dy + 1) * sh / size).max(dy * sh / size + 1).min(sh));
+    let mut acc = [0u32; 4];
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let p = bmp.pixels[(yy * sw + xx) as usize];
+            for (k, a) in acc.iter_mut().enumerate() {
+                *a += (p >> (8 * k)) & 255;
+            }
+        }
+    }
+    let n = (((x1 - x0) * (y1 - y0)).max(1)) as u32;
+    acc.iter().enumerate().fold(0, |out, (k, a)| out | (((a + n / 2) / n).min(255) << (8 * k)))
+}
+
 pub fn rect_wh(x: i32, y: i32, w: i32, h: i32) -> RECT {
     RECT { left: x, top: y, right: x + w, bottom: y + h }
 }
