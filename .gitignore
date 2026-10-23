@@ -1,0 +1,11 @@
+# Build output (any cargo target dir, including the dev/preview ones)
+/target
+/target-*
+*.pdb
+
+# Logs and local scratch
+*.log
+*.log.1
+*.bak
+*.tmp
+scratch/
