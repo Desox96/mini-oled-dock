@@ -10,6 +10,8 @@
 //! Shutdown: `Unregister*Notify` BEFORE releasing the endpoint.
 
 use windows::core::{implement, interface, IUnknown, IUnknown_Vtbl, Result as WinResult, GUID, HRESULT, PCWSTR};
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{HWND, LPARAM, PROPERTYKEY, WPARAM};
 use windows::Win32::Media::Audio::Endpoints::{
@@ -18,9 +20,9 @@ use windows::Win32::Media::Audio::Endpoints::{
 use windows::Win32::Media::Audio::{
     eCommunications, eConsole, eMultimedia, eRender, EDataFlow, ERole, IMMDevice, IMMDeviceEnumerator,
     IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator, AUDIO_VOLUME_NOTIFICATION_DATA,
-    DEVICE_STATE, DEVICE_STATE_ACTIVE,
+    DEVICE_STATE, DEVICE_STATE_ACTIVE, PKEY_AudioEndpoint_FormFactor,
 };
-use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
+use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc, PropVariantToUInt32};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, STGM_READ};
 use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
 
@@ -51,6 +53,48 @@ impl Default for VolumeState {
     }
 }
 
+/// Kind of an output endpoint, from `PKEY_AudioEndpoint_FormFactor`. Only picks the icon in the popup
+/// (and the headphone glyph of the bar volume module).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceKind {
+    /// Speakers, unknown form factor, remote devices: generic speaker.
+    Speaker,
+    Headphones,
+    Headset,
+    LineOut,
+    /// HDMI / DisplayPort (monitor, TV).
+    Display,
+    /// S/PDIF and other digital passthrough.
+    Digital,
+}
+
+impl DeviceKind {
+    /// Maps an `EndpointFormFactor` value.
+    pub fn from_form_factor(v: u32) -> DeviceKind {
+        match v {
+            2 => DeviceKind::LineOut,
+            3 => DeviceKind::Headphones,
+            5 | 6 => DeviceKind::Headset,
+            7 | 8 => DeviceKind::Digital,
+            9 => DeviceKind::Display,
+            _ => DeviceKind::Speaker,
+        }
+    }
+
+    pub fn is_headphone(self) -> bool {
+        matches!(self, DeviceKind::Headphones | DeviceKind::Headset)
+    }
+}
+
+/// true while the default render device is headphones/headset. Written by the shell thread when the
+/// endpoint is (re)opened, read by the UI thread when painting the bar (`WM_DOCK_VOLUME` is posted
+/// right after every reopen, which triggers the redraw).
+static DEFAULT_IS_HEADPHONE: AtomicBool = AtomicBool::new(false);
+
+pub fn default_is_headphone() -> bool {
+    DEFAULT_IS_HEADPHONE.load(Ordering::Relaxed)
+}
+
 /// An active output device. Plain data: it travels to the UI in
 /// `ShellEvent::AudioOutputs`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +105,8 @@ pub struct OutputDevice {
     pub name: String,
     /// true if it is the default device (`eRender`, `eConsole`).
     pub is_default: bool,
+    /// Form factor, for the icon.
+    pub kind: DeviceKind,
 }
 
 // ------------------------------------------------- IPolicyConfig (undocumented)
@@ -148,6 +194,19 @@ fn friendly_name(dev: &IMMDevice) -> Option<String> {
     // SAFETY: `pv` belongs to us and is no longer used.
     let _ = unsafe { PropVariantClear(&mut pv) };
     name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Form factor of the endpoint (`PKEY_AudioEndpoint_FormFactor`, VT_UI4); `Speaker` if unreadable.
+fn device_kind(dev: &IMMDevice) -> DeviceKind {
+    // SAFETY: `dev` is valid.
+    let Ok(store) = (unsafe { dev.OpenPropertyStore(STGM_READ) }) else { return DeviceKind::Speaker };
+    // SAFETY: `store` is valid, key is valid.
+    let Ok(mut pv) = (unsafe { store.GetValue(&PKEY_AudioEndpoint_FormFactor) }) else { return DeviceKind::Speaker };
+    // SAFETY: `pv` is a PROPVARIANT initialized by GetValue (conversion fails on VT_EMPTY, handled).
+    let kind = unsafe { PropVariantToUInt32(&pv) }.map(DeviceKind::from_form_factor).unwrap_or(DeviceKind::Speaker);
+    // SAFETY: `pv` belongs to us and is no longer used.
+    let _ = unsafe { PropVariantClear(&mut pv) };
+    kind
 }
 
 // ------------------------------------------------- COM callbacks (arbitrary threads)
@@ -268,9 +327,11 @@ impl AudioController {
             Ok(d) => d,
             Err(e) => {
                 log!("audio: no default render endpoint: {e}");
+                DEFAULT_IS_HEADPHONE.store(false, Ordering::Relaxed);
                 return;
             }
         };
+        DEFAULT_IS_HEADPHONE.store(device_kind(&dev).is_headphone(), Ordering::Relaxed);
         // SAFETY: Activate with IAudioEndpointVolume (CLSCTX_ALL, no activation parameter).
         let ep: IAudioEndpointVolume = match unsafe { dev.Activate(CLSCTX_ALL, None) } {
             Ok(e) => e,
@@ -397,7 +458,8 @@ impl AudioController {
             let Some(id) = device_id(&dev) else { continue };
             let name = friendly_name(&dev).unwrap_or_else(|| id.clone());
             let is_default = default_id.as_deref() == Some(id.as_str());
-            out.push(OutputDevice { id, name, is_default });
+            let kind = device_kind(&dev);
+            out.push(OutputDevice { id, name, is_default, kind });
         }
         out
     }

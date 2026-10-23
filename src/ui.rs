@@ -21,7 +21,10 @@
 //!    (`TIMER_ANIM`); the drop persists `pinned` / `app_order` / `tray_order` / `modules_order`.
 //!  * Click: apps (left, middle and right click), bell (Win+N via `SendInput` with
 //!    `hook::INJECT_TAG` in `dwExtraInfo`), volume (toggle mute / `ms-settings:apps-volume`), clock
-//!    (`ms-settings:dateandtime`).
+//!    (`ms-settings:dateandtime`), network (popup / right click `ms-settings:network`), metrics
+//!    (Task Manager).
+//!  * System monitor (`TIMER_SYSMON`, `sysmon_sync`): network and metrics modules, polled only while
+//!    the bar is visible; a disabled module has no timer, no state and nothing loaded.
 //!  * Themed context menu (`popup::open_app_menu`, command in `WM_DOCK_APP_MENU_CMD`): Pin/Unpin
 //!    (`config::pin/unpin`), New window, Close all windows (`apps::close_group`).
 //!    While the popup is open, auto-hide is suspended (`popup::is_open`).
@@ -68,7 +71,7 @@ use crate::icons::IconBitmap;
 use crate::log;
 use crate::msg::{
     ID_MENU_CLOSE_ALL, ID_MENU_NEW_WINDOW, ID_MENU_PIN, ID_MENU_UNPIN, TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK,
-    TIMER_POLL, TIMER_RECONCILE, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD, WM_DOCK_SHELL_READY, WM_DOCK_VOLUME,
+    TIMER_POLL, TIMER_RECONCILE, TIMER_SYSMON, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD, WM_DOCK_SHELL_READY, WM_DOCK_VOLUME,
 };
 use crate::popup::{self, Anchor, AppMenuInfo, PopupKind};
 use crate::render::{AppView, Indicator, ItemId, ItemRect, Layout, Lift, Metrics, Plate, Scene, SystemView, TrayIcon};
@@ -131,6 +134,10 @@ const DRAG_THRESHOLD: i32 = 6;
 const SLIDE_MS: u64 = 120;
 /// Duration (ms) of the indicator width change when the foreground moves (out-cubic).
 const ACT_ANIM_MS: u64 = 120;
+/// Period of `TIMER_SYSMON` (ms): one CPU/RAM sample per tick.
+const SYSMON_MS: u32 = 2000;
+/// The network is queried every this many sysmon ticks (~6 s), the first tick included.
+pub const NET_POLL_TICKS: u32 = 3;
 /// N key (Win+N opens the notification center).
 const VK_N: VIRTUAL_KEY = VIRTUAL_KEY(0x4E);
 
@@ -171,7 +178,8 @@ struct Entry {
     group_key: String,
     /// Displayed name (config.pinned.name or the shell thread's reply); empty until it arrives.
     name: String,
-    /// true if the name comes from the pin's config and must not be overwritten by the shell thread.
+    /// true if the name must not be overwritten by the shell thread (currently never: a pin's stored name
+    /// is only a fallback).
     fixed_name: bool,
     /// Icon already at the current physical size; `None` = placeholder.
     icon: Option<IconBitmap>,
@@ -279,7 +287,10 @@ struct UiState {
     /// Width of the displayed pill (physical px; 0 = never drawn).
     shown_w: i32,
     wanim: WidthAnim,
+    /// Bar metrics: monitor DPI scaled by `bar_size` (`render::bar_dpi`).
     metrics: Metrics,
+    /// Effective DPI of the bar's monitor (popups use it: they do not follow `bar_size`).
+    monitor_dpi: u32,
     entries: Vec<Entry>,
     layout: Layout,
     volume: VolumeState,
@@ -289,6 +300,8 @@ struct UiState {
     tracking_mouse: bool,
     /// Current tray icons (`tray_host::snapshot()`).
     tray: Vec<TrayView>,
+    /// Cached `tray_host::any_user_hidden()` (recomputed in `refresh_tray_state`, not per frame).
+    tray_overflow: bool,
     /// Pending notifications (bell badge).
     notif_count: usize,
     /// "Do Not Disturb" state (None = unreadable).
@@ -302,6 +315,12 @@ struct UiState {
     press_drag: bool,
     /// Reorder in progress (or settling after the drop).
     drag: Option<DragState>,
+    /// Network glyph state (last `ShellEvent::Network`); default while the module is off.
+    net: crate::net::NetStatus,
+    /// CPU / RAM usage shown by the metrics module.
+    usage: crate::metrics::Usage,
+    /// CPU sampler: exists only while the metrics module is on (`sysmon_sync`).
+    sampler: Option<crate::metrics::Sampler>,
 }
 
 thread_local! {
@@ -322,6 +341,15 @@ thread_local! {
     static LAST_NAMES: RefCell<Option<std::collections::BTreeMap<String, String>>> = const { RefCell::new(None) };
     /// Wheel remainder (WHEEL_DELTA units) not yet translated into volume steps.
     static WHEEL_ACC: Cell<i32> = const { Cell::new(0) };
+    /// true while `TIMER_SYSMON` is armed; ticks since it was armed.
+    static SYSMON_ARMED: Cell<bool> = const { Cell::new(false) };
+    /// Metrics flag the running `TIMER_SYSMON` period was computed for.
+    static SYSMON_PERIOD_METRICS: Cell<bool> = const { Cell::new(false) };
+    static SYSMON_TICKS: Cell<u32> = const { Cell::new(0) };
+    /// true once a `NetworkQuery` was sent: the shell thread holds a `net::Querier` to release.
+    static NET_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// true while the shell thread is expected to hold the audio controller (volume module on).
+    static AUDIO_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 fn now_ms() -> u64 {
@@ -335,8 +363,13 @@ fn now_ms() -> u64 {
 /// (centered bar, provisional width). Returns the `Geom` to create the window with.
 /// Called by `main::run` after `config::init()`.
 pub fn init() -> Result<Geom, String> {
-    let dpi = primary_dpi();
-    UI.with(|u| u.borrow_mut().metrics = Metrics { dpi });
+    let mon = primary_dpi();
+    let dpi = render::bar_dpi(mon, config::get().bar_size);
+    UI.with(|u| {
+        let st = &mut *u.borrow_mut();
+        st.metrics = Metrics { dpi };
+        st.monitor_dpi = mon;
+    });
     let g = compute_geom(config_top(), Metrics { dpi }.px(DEFAULT_BAR_WIDTH), dpi)?;
     GEOM.with(|c| c.set(Some(g)));
     log!(
@@ -367,7 +400,7 @@ pub fn attach(h: HWND) -> Result<(), String> {
     rebuild_entries();
     set_timer(h, TIMER_POLL, 50);
     set_timer(h, TIMER_RECONCILE, RECONCILE_MS);
-    set_timer(h, TIMER_CLOCK, crate::clock::tick_ms());
+    arm_clock(h);
     // SAFETY: registering a window message by name has no preconditions.
     let shell_msg = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
     if shell_msg == 0 {
@@ -502,13 +535,14 @@ fn on_timer(h: HWND, id: usize) -> Option<LRESULT> {
         TIMER_WIDTH => on_width_tick(h),
         TIMER_ATTN => on_attn_tick(h),
         TIMER_VIS => on_vis_tick(h),
+        TIMER_SYSMON => sysmon_tick(),
         TIMER_CLOCK => {
-            if VISIBLE.load(Relaxed) {
+            if VISIBLE.load(Relaxed) && config::get().show_clock {
                 // Re-armed one-shot: SetTimer on the same id replaces the previous interval.
                 set_timer(h, TIMER_CLOCK, crate::clock::tick_ms());
                 redraw();
             } else {
-                // Hidden: no per-tick redraws; `show_dock` redraws and re-arms the timer.
+                // Hidden bar or clock module: no per-tick redraws; `arm_clock` re-arms the timer.
                 kill_timer(h, TIMER_CLOCK);
             }
         }
@@ -530,17 +564,79 @@ pub fn toggle() {
 /// (pins/names), rereads position/auto-hide and redraws.
 pub fn on_config_changed() {
     log!("ui::on_config_changed: rebuilding items and geometry");
+    // `bar_size` changed: same path as a DPI change (fonts, icons at the new size, geometry).
+    let (mon, cur) = UI.with(|u| {
+        let st = u.borrow();
+        (st.monitor_dpi, st.metrics.dpi)
+    });
+    if mon >= 96 && render::bar_dpi(mon, config::get().bar_size) != cur {
+        apply_dpi(mon);
+    }
+    // Volume / notification modules switched: create or release their threads and COM objects.
+    modules_sync();
+    // `show_tray` switched: start or stop the tray host (stopped = no threads, no window).
+    tray_sync();
     rebuild_entries();
     // `tray_hidden` may have been edited by hand: realign the bar icons.
     refresh_tray_state();
     popup::on_tray_changed();
     // The position (top/bottom) may have changed: the geometry is always recomputed.
     redraw();
+    // Modules switched on/off: start/stop their polling and free their state.
+    sysmon_sync();
     if VISIBLE.load(Relaxed) {
-        // `show_seconds` may have changed: re-align the clock timer.
-        set_timer(hwnd(), TIMER_CLOCK, crate::clock::tick_ms());
-        let Some(g) = GEOM.with(|g| g.get()) else { return };
-        show_topmost(hwnd(), &g);
+        // `show_seconds` / `show_clock` may have changed: re-align the clock timer.
+        arm_clock(hwnd());
+        if let Some(g) = GEOM.with(|g| g.get()) {
+            show_topmost(hwnd(), &g);
+        }
+    }
+    // The bar may have moved or resized under an open popup (Settings): keep it attached to its item.
+    if let Some(a) = popup::current().and_then(item_for_popup).and_then(anchor_for) {
+        popup::reanchor(a);
+    }
+}
+
+/// Starts or stops the notification thread and the audio controller to match `show_notifications` /
+/// `show_volume` (a disabled module holds no thread, COM object or callback).
+fn modules_sync() {
+    let cfg = config::get();
+    if cfg.show_notifications && !crate::notif::is_started() {
+        crate::notif::start(hwnd());
+    } else if !cfg.show_notifications && crate::notif::is_started() {
+        let hook = popup::suspend_mouse_hook();
+        crate::notif::stop();
+        popup::resume_mouse_hook(hook);
+    }
+    let was = AUDIO_ACTIVE.with(|a| a.replace(cfg.show_volume));
+    if cfg.show_volume && !was {
+        shell_thread::request(ShellRequest::VolumeRefresh);
+    } else if !cfg.show_volume {
+        // Idempotent on the shell side (also covers a module that was already off at startup).
+        shell_thread::request(ShellRequest::AudioRelease);
+    }
+}
+
+/// Starts the tray host when `show_tray` is switched on (native taskbar hidden), stops it when switched
+/// off; in both cases `TaskbarCreated` is announced so apps re-register their icons with whoever now owns
+/// the tray (our host, or Explorer). Blocks the UI thread for at most ~2 s, only on a real switch.
+fn tray_sync() {
+    let on = config::get().show_tray;
+    let started = tray_host::is_started();
+    if on && !started && crate::taskbar::is_hidden() {
+        // The wait below must not run under the popup's low-level mouse hook (it would stall the mouse).
+        let hook = popup::suspend_mouse_hook();
+        match tray_host::start(hwnd()) {
+            Ok(()) => crate::taskbar::announce_tray(),
+            Err(e) => log!("tray host not started: {e}"),
+        }
+        popup::resume_mouse_hook(hook);
+    } else if !on && started {
+        let hook = popup::suspend_mouse_hook();
+        tray_host::stop();
+        crate::taskbar::announce_tray();
+        popup::resume_mouse_hook(hook);
+        log!("tray: host stopped (show_tray off)");
     }
 }
 
@@ -552,7 +648,12 @@ fn refresh_tray_state() {
         // Stable sort: icons missing from `tray_order` keep their registration order, at the end.
         snap.sort_by_key(|t| cfg.tray_order.iter().position(|k| k.eq_ignore_ascii_case(&t.key)).unwrap_or(usize::MAX));
     }
-    UI.with(|u| u.borrow_mut().tray = snap);
+    let overflow = tray_host::any_user_hidden();
+    UI.with(|u| {
+        let st = &mut *u.borrow_mut();
+        st.tray = snap;
+        st.tray_overflow = overflow;
+    });
 }
 
 /// `WM_DOCK_TRAY_CHANGED` (wParam = 1 bitmap, 2 layout): rereads `tray_host::snapshot()` and redraws.
@@ -594,8 +695,9 @@ fn item_for_popup(kind: PopupKind) -> Option<ItemId> {
         PopupKind::Notifications => Some(ItemId::Notifications),
         PopupKind::Audio => Some(ItemId::Volume),
         PopupKind::Calendar => Some(ItemId::Clock),
-        PopupKind::Power => Some(ItemId::Power),
+        PopupKind::Power | PopupKind::Settings => Some(ItemId::Power),
         PopupKind::TrayOverflow => Some(ItemId::TrayOverflow),
+        PopupKind::Network => Some(ItemId::Network),
         PopupKind::AppMenu => None,
     }
 }
@@ -605,7 +707,7 @@ fn anchor_for(id: ItemId) -> Option<Anchor> {
     let g = GEOM.with(|g| g.get())?;
     let (r, dpi) = UI.with(|u| {
         let st = u.borrow();
-        (st.layout.rect_of(id), st.metrics.dpi)
+        (st.layout.rect_of(id), if st.monitor_dpi >= 96 { st.monitor_dpi } else { st.metrics.dpi })
     });
     let r = r?;
     Some(Anchor {
@@ -702,6 +804,7 @@ pub fn redraw() {
     let wa = mi.rcWork;
     let max_width = (wa.right - wa.left - 2 * m.px(render::EDGE_MARGIN)).max(0);
     let date = if cfg.show_date && !clock.date.is_empty() { Some(clock.date.as_str()) } else { None };
+    let modules = render::visible_modules(&cfg);
 
     let now = now_ms();
     let attn: Vec<isize> = ATTN.with(|a| a.borrow().clone());
@@ -741,7 +844,7 @@ pub fn redraw() {
             apps: &views,
             tray: &tray_icons,
             overflow_enabled: popup::is_available(),
-            force_chevron: true, // the chevron is always the entry to the tray visibility settings
+            force_chevron: st.tray_overflow, // chevron only if some icon is hidden
             bar_top: top,
             system: SystemView {
                 volume: st.volume,
@@ -750,9 +853,11 @@ pub fn redraw() {
                 date,
                 bell_badge: st.notif_count > 0,
                 bell_dnd: st.notif_dnd == Some(true),
+                net: st.net,
+                usage: st.usage,
             },
             plate: None,
-            modules: render::modules_from_names(&cfg.modules_order),
+            modules: &modules,
             lift: None,
             hover: st.hover.or_else(|| popup::current().and_then(item_for_popup)),
             max_width,
@@ -1015,8 +1120,10 @@ fn rebuild_entries() {
             let mut e = Entry {
                 key: p.key.clone(),
                 group_key: p.key.clone(),
+                // The stored name is only a placeholder/fallback: the live resolver (and the `names`
+                // overrides) replace it as soon as the shell thread answers.
                 name: p.name.clone(),
-                fixed_name: !p.name.is_empty(),
+                fixed_name: false,
                 pinned: true,
                 custom_icon: p.icon.clone(),
                 ..Default::default()
@@ -1152,6 +1259,9 @@ fn request_missing() {
 
 /// Applies a result from the shell thread; true if something changed.
 fn apply_shell_event(ev: ShellEvent) -> bool {
+    if let ShellEvent::Network(info) = ev {
+        return apply_network(info);
+    }
     UI.with(|u| {
         let st = &mut *u.borrow_mut();
         let px = st.metrics.px(render::ICON_SIZE).max(1) as u32;
@@ -1182,8 +1292,23 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
                 crate::popup::on_audio_outputs(list);
                 false
             }
+            // Handled by `apply_network` before the borrow.
+            ShellEvent::Network(_) => false,
         }
     })
+}
+
+/// New network status: stored for the bar glyph and forwarded to the network popup (outside the
+/// `UI` borrow: the popup may relayout). true if the glyph changed. A late reply after the module
+/// was switched off is ignored.
+fn apply_network(info: crate::net::NetInfo) -> bool {
+    if !NET_ACTIVE.with(|a| a.get()) {
+        return false;
+    }
+    let status = info.status();
+    let changed = UI.with(|u| std::mem::replace(&mut u.borrow_mut().net, status) != status);
+    popup::on_network(info);
+    changed
 }
 
 /// Re-enumerates the windows; if they changed, rebuilds the items and redraws.
@@ -1195,11 +1320,13 @@ fn refresh_apps() {
     }
 }
 
-/// New DPI (or monitor change): metrics, fonts, icon requests, geometry.
-fn apply_dpi(dpi: u32) {
+/// New monitor DPI (or monitor change, or `bar_size` change): metrics, fonts, icon requests, geometry.
+fn apply_dpi(mon: u32) {
+    let dpi = render::bar_dpi(mon, config::get().bar_size);
     let m = Metrics { dpi };
     let changed = UI.with(|u| {
         let st = &mut *u.borrow_mut();
+        st.monitor_dpi = mon;
         if st.metrics == m {
             return false;
         }
@@ -1510,12 +1637,14 @@ fn on_rbutton_up(lp: LPARAM) {
             }
         }
         Some(ItemId::Volume) => launch_target_str("ms-settings:apps-volume"),
+        Some(ItemId::Network) => launch_target_str("ms-settings:network"),
         Some(ItemId::Tray(id)) => tray_click(id, TrayClick::Right),
         Some(ItemId::Notifications)
         | Some(ItemId::Clock)
         | Some(ItemId::TrayOverflow)
         | Some(ItemId::ShowDesktop)
         | Some(ItemId::Power)
+        | Some(ItemId::Metrics)
         | None => {}
     }
 }
@@ -1595,9 +1724,13 @@ fn zone_of(id: ItemId) -> Option<Zone> {
         ItemId::App(_) => Some(Zone::Apps),
         ItemId::Tray(_) => Some(Zone::Tray),
         ItemId::TrayOverflow => None,
-        ItemId::Notifications | ItemId::Volume | ItemId::Clock | ItemId::ShowDesktop | ItemId::Power => {
-            Some(Zone::Modules)
-        }
+        ItemId::Notifications
+        | ItemId::Volume
+        | ItemId::Clock
+        | ItemId::ShowDesktop
+        | ItemId::Power
+        | ItemId::Network
+        | ItemId::Metrics => Some(Zone::Modules),
     }
 }
 
@@ -1931,6 +2064,23 @@ fn reorder_pinned(c: &mut config::Config, keys: &[String]) {
     }
 }
 
+/// Full module order after a drag of the VISIBLE modules: the hidden ones keep their slots, the
+/// visible slots take `visible` in its new order.
+fn reorder_visible_modules(old: &[String], visible: &[String]) -> Vec<String> {
+    let mut next = visible.iter();
+    render::modules_from_names(old)
+        .into_iter()
+        .filter_map(render::module_name)
+        .map(|n| {
+            if visible.iter().any(|v| v == n) {
+                next.next().cloned().unwrap_or_else(|| n.to_string())
+            } else {
+                n.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Persists the new order of the dragged zone (atomic config rewrite) and rebuilds the items.
 fn commit_drag(d: &DragState) {
     let mut keys = d.keys.clone();
@@ -1940,7 +2090,7 @@ fn commit_drag(d: &DragState) {
         Zone::Apps if d.pinned => config::modify(|c| reorder_pinned(c, &keys)),
         Zone::Apps => config::modify(|c| c.app_order = merge_order(&keys, &c.app_order, config::APP_ORDER_CAP)),
         Zone::Tray => config::modify(|c| c.tray_order = merge_order(&keys, &c.tray_order, config::TRAY_ORDER_CAP)),
-        Zone::Modules => config::modify(|c| c.modules_order = keys.clone()),
+        Zone::Modules => config::modify(|c| c.modules_order = reorder_visible_modules(&c.modules_order, &keys)),
     };
     match r {
         Ok(()) => on_config_changed(),
@@ -2011,6 +2161,17 @@ fn click_left(id: ItemId) {
         ItemId::ShowDesktop => {
             popup::close("show desktop");
             shell_thread::request(ShellRequest::ToggleDesktop);
+        }
+        ItemId::Network => {
+            if popup::is_available() {
+                toggle_popup(PopupKind::Network, id);
+            } else {
+                launch_target_str("ms-settings:network");
+            }
+        }
+        ItemId::Metrics => {
+            popup::close("task manager");
+            launch_target_str("taskmgr.exe");
         }
     }
 }
@@ -2224,8 +2385,9 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
     HIDE_AT.store(now_ms() + hide_after_ms, Relaxed);
     VISIBLE.store(true, Relaxed);
     if !was_visible {
-        // The clock timer is off while hidden: redraw happened above, re-align it now.
-        set_timer(hwnd(), TIMER_CLOCK, crate::clock::tick_ms());
+        // The clock and sysmon timers are off while hidden: redraw happened above, re-arm them now.
+        arm_clock(hwnd());
+        sysmon_sync();
     }
     log!("SHOW ({reason}), hiding in {hide_after_ms} ms");
     if !was_visible {
@@ -2256,6 +2418,7 @@ pub fn hide_dock(reason: &str) {
     VISIBLE.store(false, Relaxed);
     reset_hover();
     kill_timer(hwnd(), TIMER_CLOCK);
+    sysmon_sync();
     let was_animating = UI.with(|u| std::mem::replace(&mut u.borrow_mut().wanim.running, false));
     kill_timer(hwnd(), TIMER_WIDTH);
     if was_animating {
@@ -2268,6 +2431,101 @@ pub fn hide_dock(reason: &str) {
     log!("HIDE ({reason})");
     if prev != 0 {
         restore_foreground(HWND(prev as *mut std::ffi::c_void));
+    }
+}
+
+/// (Re)arms the one-shot clock timer, aligned to the next minute/second: only while the bar is
+/// visible and the clock module is shown (otherwise it is killed).
+fn arm_clock(h: HWND) {
+    if VISIBLE.load(Relaxed) && config::get().show_clock {
+        set_timer(h, TIMER_CLOCK, crate::clock::tick_ms());
+    } else {
+        kill_timer(h, TIMER_CLOCK);
+    }
+}
+
+// ------------------------------------------------------- system monitor (network, metrics)
+
+/// `TIMER_SYSMON` period: 2 s with metrics on; with only the network on every tick is a network poll,
+/// so the timer runs at the poll period instead of waking up for nothing.
+fn sysmon_period(metrics: bool) -> u32 {
+    if metrics {
+        SYSMON_MS
+    } else {
+        SYSMON_MS * NET_POLL_TICKS
+    }
+}
+
+/// Matches `TIMER_SYSMON` and the module state to the config and to the bar's visibility. Called on
+/// show, hide and config change. ZERO COST WHEN OFF: a disabled module drops its state at once
+/// (CPU sampler; the shell thread's `net::Querier` via `NetworkRelease`, which unloads its libraries
+/// and COM object), and with both modules off or the bar hidden the timer does not exist.
+fn sysmon_sync() {
+    let cfg = config::get();
+    let (net_on, met_on) = (cfg.show_network, cfg.show_metrics);
+    if !met_on {
+        UI.with(|u| {
+            let st = &mut *u.borrow_mut();
+            st.sampler = None;
+            st.usage = crate::metrics::Usage::default();
+        });
+    }
+    if !net_on && NET_ACTIVE.with(|a| a.replace(false)) {
+        shell_thread::request(ShellRequest::NetworkRelease);
+        UI.with(|u| u.borrow_mut().net = crate::net::NetStatus::default());
+        popup::on_network(crate::net::NetInfo::default());
+    }
+    let want = VISIBLE.load(Relaxed) && (net_on || met_on);
+    let armed = SYSMON_ARMED.with(|a| a.get());
+    if want && !armed {
+        SYSMON_ARMED.with(|a| a.set(true));
+        SYSMON_TICKS.with(|t| t.set(0));
+        set_timer(hwnd(), TIMER_SYSMON, sysmon_period(met_on));
+        SYSMON_PERIOD_METRICS.with(|p| p.set(met_on));
+        // First sample / query right away: the bar just appeared.
+        sysmon_tick();
+    } else if want && armed && SYSMON_PERIOD_METRICS.with(|p| p.replace(met_on)) != met_on {
+        // Metrics switched: 2 s for the sampler, the network period alone otherwise.
+        SYSMON_TICKS.with(|t| t.set(0));
+        set_timer(hwnd(), TIMER_SYSMON, sysmon_period(met_on));
+    } else if !want && armed {
+        SYSMON_ARMED.with(|a| a.set(false));
+        kill_timer(hwnd(), TIMER_SYSMON);
+    }
+}
+
+/// `TIMER_SYSMON`: CPU/RAM sample (metrics on), network query every `NET_POLL_TICKS` ticks (network
+/// on; the reply arrives as `ShellEvent::Network`). Redraws only if the metrics changed.
+fn sysmon_tick() {
+    let cfg = config::get();
+    let n = SYSMON_TICKS.with(|t| {
+        let n = t.get();
+        t.set(n.wrapping_add(1));
+        n
+    });
+    let mut changed = false;
+    if cfg.show_metrics {
+        changed = UI.with(|u| {
+            let st = &mut *u.borrow_mut();
+            let usage = match st.sampler.as_mut() {
+                Some(s) => s.sample(),
+                None => {
+                    // Primed now: the CPU figure starts with the next tick.
+                    let s = crate::metrics::Sampler::new();
+                    let u = s.last();
+                    st.sampler = Some(s);
+                    u
+                }
+            };
+            std::mem::replace(&mut st.usage, usage) != usage
+        });
+    }
+    if cfg.show_network && (!cfg.show_metrics || n.is_multiple_of(NET_POLL_TICKS)) {
+        NET_ACTIVE.with(|a| a.set(true));
+        shell_thread::request(ShellRequest::NetworkQuery);
+    }
+    if changed {
+        redraw_if_visible();
     }
 }
 
@@ -2549,6 +2807,21 @@ mod tests {
         assert_eq!(order(1, 0), [1, 0, 2, 3]);
         assert_eq!(order(2, 2), [0, 1, 2, 3]);
         assert_eq!(order(0, 3), [1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn hidden_modules_keep_their_slots() {
+        let old: Vec<String> = ["notifications", "volume", "clock", "show_desktop", "power"].map(String::from).to_vec();
+        // Old 5-module config: network / metrics come back next to their default neighbours.
+        let full = render::modules_from_names(&old);
+        assert_eq!(full.len(), 7);
+        assert_eq!(full[0], ItemId::Metrics);
+        assert_eq!(full[2], ItemId::Network);
+        // Drag among the visible ones (metrics hidden): power moved first.
+        let vis: Vec<String> =
+            ["power", "notifications", "network", "volume", "clock", "show_desktop"].map(String::from).to_vec();
+        let out = reorder_visible_modules(&old, &vis);
+        assert_eq!(out, ["metrics", "power", "notifications", "network", "volume", "clock", "show_desktop"]);
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! POWER popup: Sleep, Lock, Restart, Shut down, separator,
-//! "Start with Windows" (toggle, scheduled task: `autostart`), "Exit dock". A click runs the action immediately: the menu itself guards against accidental clicks
+//! POWER popup: Sleep, Lock, Restart, Shut down, separator, "Settings" (switches to the Settings
+//! popup, `popup_settings`), "Start with Windows" (toggle, scheduled task: `autostart`), "Exit dock". A click runs the action immediately: the menu itself guards against accidental clicks
 //! (user's choice, no confirmation). Actions in `power::run`.
 
 use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::log;
 use crate::popup::{center_y, hline, lift, row_plate, toggle_switch, Content, HitMap, PopupKind, Reply};
 use crate::power::{self, PowerAction};
-use crate::surface::{rect_wh, Font, Surface, TEXT2_ALPHA, TEXT_ALPHA, WHITE};
+use crate::surface::{rect_wh, Font, Surface, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE};
 
 const ID_SLEEP: u32 = 1;
 const ID_LOCK: u32 = 2;
@@ -16,6 +16,7 @@ const ID_RESTART: u32 = 3;
 const ID_SHUTDOWN: u32 = 4;
 const ID_EXIT: u32 = 5;
 const ID_AUTOSTART: u32 = 6;
+const ID_SETTINGS: u32 = 7;
 
 /// State of the "Start with Windows" toggle (shared with the threads that query/modify the task).
 const AS_UNKNOWN: u8 = 0;
@@ -67,6 +68,7 @@ fn label(id: u32) -> &'static str {
         ID_RESTART => "Restart",
         ID_SHUTDOWN => "Shut down",
         ID_AUTOSTART => "Start with Windows",
+        ID_SETTINGS => "Settings",
         _ => "Exit dock",
     }
 }
@@ -90,6 +92,8 @@ impl Content for PowerPopup {
         }
         self.sep_y = y + m.px(6);
         y += m.px(6) * 2 + m.px(1);
+        self.hits.add(ID_SETTINGS, rect_wh(inset, y, w - 2 * inset, row));
+        y += row;
         self.hits.add(ID_AUTOSTART, rect_wh(inset, y, w - 2 * inset, row));
         y += row;
         self.hits.add(ID_EXIT, rect_wh(inset, y, w - 2 * inset, row));
@@ -101,13 +105,17 @@ impl Content for PowerPopup {
         s.panel();
         let inset = s.metrics().px(8);
         hline(s, inset + self.pad_text, self.width - inset - self.pad_text, self.sep_y);
-        for id in [ID_SLEEP, ID_LOCK, ID_RESTART, ID_SHUTDOWN, ID_AUTOSTART, ID_EXIT] {
+        for id in [ID_SLEEP, ID_LOCK, ID_RESTART, ID_SHUTDOWN, ID_SETTINGS, ID_AUTOSTART, ID_EXIT] {
             let Some(rc) = self.hits.rect(id) else { continue };
             let h = row_plate(s, rc, id, hot, pressed);
             let (txt, alpha) = if id == ID_EXIT { (label(id), TEXT2_ALPHA) } else { (label(id), TEXT_ALPHA) };
             let font = Font::Normal;
             let y = center_y(&rc, s.line_height(font));
             s.text(txt, rc.left + self.pad_text, y, font, WHITE, lift(alpha, h));
+            if id == ID_SETTINGS {
+                let cw = s.text_width("\u{203A}", font);
+                s.text("\u{203A}", rc.right - self.pad_text - cw, y, font, WHITE, lift(TEXT3_ALPHA, h));
+            }
             if id == ID_AUTOSTART {
                 let st = self.autostart.load(SeqCst);
                 let m = s.metrics();
@@ -137,6 +145,9 @@ impl Content for PowerPopup {
     fn click(&mut self, id: u32) -> Reply {
         if id == ID_AUTOSTART {
             return self.toggle_autostart();
+        }
+        if id == ID_SETTINGS {
+            return Reply::Switch(PopupKind::Settings);
         }
         self.pending = Some(match id {
             ID_SLEEP => PowerAction::Sleep,

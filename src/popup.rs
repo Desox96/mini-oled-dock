@@ -1,4 +1,4 @@
-//! Mini OLED popup (notifications, audio, calendar, power, tray overflow): a layered window
+//! Mini OLED popup (notifications, audio, calendar, power, settings, tray overflow, network): a layered window
 //! SEPARATE from the bar, only one open at a time.
 //!
 //! WINDOW: class `DockPopup`, `WS_POPUP`, `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`
@@ -11,6 +11,12 @@
 //! closes it explicitly), action performed, dock hidden. On every close
 //! `WM_DOCK_POPUP_CLOSED` is posted to the dock window.
 //!
+//! OUTSIDE CLICKS: `WM_ACTIVATE` alone is not reliable (the popup is opened from a click on the NOACTIVATE
+//! bar and `SetForegroundWindow` may be refused or the foreground may never leave the previous app), so
+//! while a popup is open a `WH_MOUSE_LL` hook watches button-down events and posts `WM_POPUP_OUTSIDE`
+//! when the click is outside the popup (and outside the anchor item, which `toggle` handles on release).
+//! The hook exists ONLY while a popup is open (installed in `open`, removed in `close_inner`).
+//!
 //! TOGGLE: `toggle(kind)` on the same kind already open closes it; if the popup of that kind was closed
 //! by `WA_INACTIVE` less than `TOGGLE_DEBOUNCE_MS` ago it is NOT reopened (it was the same click).
 //!
@@ -20,6 +26,7 @@
 //! never a panic (panic = abort).
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -32,8 +39,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow, IsWindow, KillTimer,
-    LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetTimer, ShowWindow, UnregisterClassW, HTCLIENT,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow, IsWindow, KillTimer,
+    LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetTimer, SetWindowsHookExW, ShowWindow,
+    UnhookWindowsHookEx, UnregisterClassW, HHOOK, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
+    WM_XBUTTONDOWN, HTCLIENT,
     IDC_ARROW, IDC_HAND, SW_HIDE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -45,7 +54,7 @@ pub(crate) mod popup_app;
 
 use crate::audio::{OutputDevice, VolumeState};
 use crate::log;
-use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED};
+use crate::msg::{TIMER_POPUP_ANIM, TIMER_POPUP_TICK, WM_DOCK_POPUP_CLOSED, WM_POPUP_OUTSIDE};
 use crate::render::Metrics;
 use crate::surface::Surface;
 
@@ -74,6 +83,8 @@ pub enum PopupKind {
     Power = 4,
     TrayOverflow = 5,
     AppMenu = 6,
+    Network = 7,
+    Settings = 8,
 }
 
 /// Where to open the popup. SCREEN coordinates in physical pixels.
@@ -141,6 +152,12 @@ pub fn open_app_menu(anchor: Anchor, info: AppMenuInfo) {
     open(PopupKind::AppMenu, anchor);
 }
 
+/// The next tray popup opens directly in the "choose visible icons" mode (the Settings popup sets it
+/// and then replies `Reply::Switch(PopupKind::TrayOverflow)`).
+pub(crate) fn next_tray_chooser() {
+    TRAY_CHOOSER.store(true, Ordering::Relaxed);
+}
+
 /// Key of the app chosen last in the context menu (consumes it). UI thread.
 pub fn take_app_menu_key() -> Option<String> {
     APP_CHOSEN_KEY.with(|k| k.try_borrow_mut().ok().and_then(|mut g| g.take()))
@@ -159,6 +176,9 @@ pub(crate) fn set_app_menu_key(key: String) {
         }
     });
 }
+
+/// The next `TrayOverflow` content opens in chooser mode (consumed by `make_content`).
+static TRAY_CHOOSER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// Key of the item for which the app menu is (or was) open.
@@ -182,6 +202,8 @@ pub(crate) enum Reply {
     Relayout,
     /// Close the popup (action performed).
     Close,
+    /// Close this popup and open `kind` at the same anchor (power -> settings -> tray chooser).
+    Switch(PopupKind),
 }
 
 impl Reply {
@@ -193,6 +215,7 @@ impl Reply {
                 Reply::Redraw => 1,
                 Reply::Relayout => 2,
                 Reply::Close => 3,
+                Reply::Switch(_) => 4,
             }
         }
         if rank(other) > rank(self) {
@@ -217,6 +240,7 @@ pub(crate) enum DataEvent {
     AudioOutputs(Vec<OutputDevice>),
     NotifChanged,
     TrayChanged,
+    Network(crate::net::NetInfo),
 }
 
 /// A popup content. Client coordinates of the popup, physical pixels. `hot`/`pressed` are the ids of the
@@ -320,6 +344,8 @@ struct State {
     last_inactive: Option<(PopupKind, u64)>,
     /// Last `VolumeState` received (even while the popup is closed).
     last_volume: VolumeState,
+    /// Last network status received (initial data of the network popup; empty while the module is off).
+    last_net: crate::net::NetInfo,
 }
 
 thread_local! {
@@ -330,6 +356,7 @@ thread_local! {
         open: None,
         last_inactive: None,
         last_volume: VolumeState::default(),
+        last_net: crate::net::NetInfo::default(),
     });
 }
 
@@ -399,7 +426,9 @@ pub fn toggle(kind: PopupKind, anchor: Anchor) {
         if !st.available {
             return Plan::Skip;
         }
-        if st.open.as_ref().map(|o| o.kind) == Some(kind) {
+        let open = st.open.as_ref().map(|o| o.kind);
+        // Settings is opened from the power popup and shares its item: the power button closes it too.
+        if open == Some(kind) || (kind == PopupKind::Power && open == Some(PopupKind::Settings)) {
             return Plan::Close;
         }
         if let Some((k, t)) = st.last_inactive {
@@ -433,6 +462,22 @@ pub fn current() -> Option<PopupKind> {
     STATE.with(|s| s.try_borrow().ok().and_then(|g| g.open.as_ref().map(|o| o.kind)))
 }
 
+/// The bar moved or resized (config change) while a popup is open: re-anchors it to `anchor` (the
+/// same item's new rectangle). Called by `ui`.
+pub fn reanchor(anchor: Anchor) {
+    let moved = with(|st| match st.open.as_mut() {
+        Some(o) => {
+            o.anchor = anchor;
+            true
+        }
+        None => false,
+    });
+    if moved == Some(true) {
+        store_rect(&ITEM_RECT, &anchor.item);
+        render(true);
+    }
+}
+
 /// `WM_DOCK_VOLUME` reached the UI: updates the audio popup if open. Called by `ui`.
 pub fn on_volume(st: VolumeState) {
     with(|s| s.last_volume = st);
@@ -443,6 +488,18 @@ pub fn on_volume(st: VolumeState) {
 pub fn on_audio_outputs(list: Vec<OutputDevice>) {
     if is_open() {
         dispatch(DataEvent::AudioOutputs(list));
+    }
+}
+
+/// `ShellEvent::Network` reached the UI: remembered for the next network popup and forwarded to
+/// the open one. Called by `ui`.
+pub fn on_network(info: crate::net::NetInfo) {
+    let open = with(|s| {
+        s.last_net.clone_from(&info);
+        s.open.as_ref().is_some_and(|o| o.kind == PopupKind::Network)
+    });
+    if open == Some(true) {
+        dispatch(DataEvent::Network(info));
     }
 }
 
@@ -482,17 +539,110 @@ pub fn shutdown() {
     }
 }
 
+// ------------------------------------------------------------------ outside-click hook
+
+/// Installed `WH_MOUSE_LL` handle (0 = none).
+static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
+/// Popup window rectangle (screen px) and anchor item rectangle, read by the hook callback:
+/// `[left, top, right, bottom]` each.
+static POPUP_RECT: [AtomicI32; 4] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+static ITEM_RECT: [AtomicI32; 4] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+
+fn store_rect(dst: &[AtomicI32; 4], r: &RECT) {
+    dst[0].store(r.left, Ordering::Relaxed);
+    dst[1].store(r.top, Ordering::Relaxed);
+    dst[2].store(r.right, Ordering::Relaxed);
+    dst[3].store(r.bottom, Ordering::Relaxed);
+}
+
+fn in_rect(r: &[AtomicI32; 4], p: POINT) -> bool {
+    p.x >= r[0].load(Ordering::Relaxed)
+        && p.x < r[2].load(Ordering::Relaxed)
+        && p.y >= r[1].load(Ordering::Relaxed)
+        && p.y < r[3].load(Ordering::Relaxed)
+}
+
+/// Installs the outside-click hook (idempotent). The callback runs on this (UI) thread during message
+/// pumping, so it only reads atomics and posts a message.
+fn install_mouse_hook() {
+    if MOUSE_HOOK.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    // SAFETY: no preconditions.
+    let module = unsafe { GetModuleHandleW(PCWSTR::null()) }.ok();
+    // SAFETY: the callback is a valid `extern "system"` fn for the lifetime of the process.
+    match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), module.map(|m| HINSTANCE(m.0)), 0) } {
+        Ok(h) => MOUSE_HOOK.store(h.0 as isize, Ordering::Relaxed),
+        Err(e) => log!("popup: SetWindowsHookExW(WH_MOUSE_LL) failed: {e}"),
+    }
+}
+
+/// Removes the outside-click hook for the duration of a long blocking call on the UI thread (a stalled
+/// low-level hook freezes the system mouse and is dropped by Windows after `LowLevelHooksTimeout`).
+/// Returns true if it was installed; pass that to `resume_mouse_hook` afterwards.
+pub fn suspend_mouse_hook() -> bool {
+    let was = MOUSE_HOOK.load(Ordering::Relaxed) != 0;
+    remove_mouse_hook();
+    was
+}
+
+/// Reinstalls the hook removed by `suspend_mouse_hook`, if a popup is still open.
+pub fn resume_mouse_hook(was: bool) {
+    if was && is_open() {
+        install_mouse_hook();
+    }
+}
+
+fn remove_mouse_hook() {
+    let raw = MOUSE_HOOK.swap(0, Ordering::Relaxed);
+    if raw != 0 {
+        // SAFETY: handle returned by SetWindowsHookExW, removed only once (swap).
+        if let Err(e) = unsafe { UnhookWindowsHookEx(HHOOK(raw as *mut _)) } {
+            log!("popup: UnhookWindowsHookEx failed: {e}");
+        }
+    }
+}
+
+unsafe extern "system" fn ll_mouse_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code >= 0 {
+        let m = wp.0 as u32;
+        if m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN || m == WM_XBUTTONDOWN {
+            // SAFETY: for HC_ACTION in a WH_MOUSE_LL hook, lparam points to an MSLLHOOKSTRUCT valid
+            // for the duration of the callback.
+            let pt = unsafe { (*(lp.0 as *const MSLLHOOKSTRUCT)).pt };
+            if !in_rect(&POPUP_RECT, pt) && !in_rect(&ITEM_RECT, pt) {
+                // try_borrow: if the state is busy the hwnd read is skipped (the tick safety net remains).
+                let hwnd = STATE.with(|s| s.try_borrow().map(|g| g.hwnd).unwrap_or_default());
+                if !hwnd.0.is_null() {
+                    // SAFETY: posting to our own window; failure is harmless.
+                    let _ = unsafe { PostMessageW(Some(hwnd), WM_POPUP_OUTSIDE, WPARAM(0), LPARAM(0)) };
+                }
+            }
+        }
+    }
+    // SAFETY: unchanged forwarding to the hook chain.
+    unsafe { CallNextHookEx(None, code, wp, lp) }
+}
+
 // ------------------------------------------------------------------ open / close
 
 /// Builds the content for `kind`.
-fn make_content(kind: PopupKind, volume: VolumeState) -> Box<dyn Content> {
+fn make_content(kind: PopupKind, volume: VolumeState, net: crate::net::NetInfo) -> Box<dyn Content> {
     match kind {
         PopupKind::Notifications => crate::popup_notif::new(),
         PopupKind::Audio => crate::popup_audio::new(volume),
         PopupKind::Calendar => crate::popup_calendar::new(),
         PopupKind::Power => crate::popup_power::new(),
-        PopupKind::TrayOverflow => crate::popup_tray::new(),
+        PopupKind::TrayOverflow => {
+            if TRAY_CHOOSER.swap(false, Ordering::Relaxed) {
+                crate::popup_tray::new_chooser()
+            } else {
+                crate::popup_tray::new()
+            }
+        }
         PopupKind::AppMenu => popup_app::new(take_app_info().unwrap_or_default()),
+        PopupKind::Network => crate::popup_network::new(net),
+        PopupKind::Settings => crate::popup_settings::new(),
     }
 }
 
@@ -586,8 +736,8 @@ fn open(kind: PopupKind, anchor: Anchor) {
     };
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
-    let Some(volume) = with(|st| st.last_volume) else { return };
-    let content = make_content(kind, volume);
+    let Some((volume, net)) = with(|st| (st.last_volume, st.last_net.clone())) else { return };
+    let content = make_content(kind, volume, net);
     debug_assert_eq!(content.kind(), kind);
     let installed = with(|st| {
         st.last_inactive = None;
@@ -618,6 +768,8 @@ fn open(kind: PopupKind, anchor: Anchor) {
     // No borrow during ShowWindow / force_foreground: they can deliver messages to the popup.
     // SAFETY: `hwnd` is our popup window.
     let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+    store_rect(&ITEM_RECT, &anchor.item);
+    install_mouse_hook();
     crate::ui::force_foreground(hwnd);
     // SAFETY: `hwnd` is our window; the callbacks are in its wnd_proc.
     unsafe {
@@ -659,6 +811,7 @@ fn close_inner(reason: &str) {
         let _ = KillTimer(Some(hwnd), TIMER_POPUP_ANIM);
         let _ = KillTimer(Some(hwnd), TIMER_POPUP_TICK);
     }
+    remove_mouse_hook();
     if o.pressed.is_some() {
         // SAFETY: releases any mouse capture taken by this popup.
         let _ = unsafe { ReleaseCapture() };
@@ -703,6 +856,8 @@ fn render(relayout: bool) -> bool {
     })
     .flatten();
     let Some((hwnd, surf, pos, alpha)) = prepared else { return false };
+    let (sw, sh) = surf.size();
+    store_rect(&POPUP_RECT, &RECT { left: pos.0, top: pos.1, right: pos.0 + sw, bottom: pos.1 + sh });
     let ok = surf.present(hwnd, pos.0, pos.1, alpha);
     with(|st| {
         if let Some(o) = st.open.as_mut() {
@@ -722,6 +877,13 @@ fn apply(reply: Reply) {
             render(true);
         }
         Reply::Close => close_inner("action"),
+        Reply::Switch(kind) => {
+            let anchor = with(|st| st.open.as_ref().map(|o| o.anchor)).flatten();
+            close_inner("switch");
+            if let Some(a) = anchor {
+                open(kind, a);
+            }
+        }
     }
 }
 
@@ -751,6 +913,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             } else {
                 mark_active(hwnd);
             }
+            LRESULT(0)
+        }
+        WM_POPUP_OUTSIDE => {
+            close_inner("click outside");
             LRESULT(0)
         }
         WM_KEYDOWN => {
@@ -1016,7 +1182,15 @@ fn on_tick(hwnd: HWND) {
     })
     .flatten();
     let Some((reply, was_active, fg_at_open)) = r else { return };
-    if !was_active {
+    if was_active {
+        // Activation was seen: if the foreground is now another window, WA_INACTIVE was missed.
+        // SAFETY: no preconditions.
+        let fg = unsafe { GetForegroundWindow() };
+        if fg != hwnd && !fg.0.is_null() {
+            close_inner("foreground changed");
+            return;
+        }
+    } else {
         // Safety net: the foreground steal can fail and the popup would never receive WA_INACTIVE.
         // SAFETY: no preconditions.
         let fg = unsafe { GetForegroundWindow() };

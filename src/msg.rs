@@ -53,6 +53,14 @@ pub const WM_DOCK_POPUP_CLOSED: u32 = WM_APP + 12;
 /// themed context menu. wParam = `ID_MENU_*` (PIN/UNPIN/CLOSE_ALL/NEW_WINDOW), lParam = 0.
 /// The app key is read with `popup::take_app_menu_key()`. Handled by `ui::handle_message`.
 pub const WM_DOCK_APP_MENU_CMD: u32 = WM_APP + 13;
+/// popup mouse hook (WH_MOUSE_LL, runs on the UI thread, installed only while a popup is open) ->
+/// POPUP window (not the dock's): a mouse button went down outside the popup. wParam = lParam = 0.
+/// Posted (never handled inside the hook callback); the popup closes itself.
+pub const WM_POPUP_OUTSIDE: u32 = WM_APP + 14;
+/// Settings popup (UI thread, popup window) -> dock window: a setting was changed and saved
+/// (`config::modify`). wParam = lParam = 0. Posted so the bar is rebuilt OUTSIDE the popup's
+/// wnd_proc (no re-entry). `main` calls `ui::on_config_changed()`.
+pub const WM_DOCK_CONFIG_APPLY: u32 = WM_APP + 15;
 
 // `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)
 // defined privately in `hook.rs` (`WM_HOOK_REINSTALL`). Do not reuse it.
@@ -94,6 +102,11 @@ pub const TIMER_CLOCK: usize = 8;
 /// restart (the new Shell_TrayWnd is created in front of our tray host). Armed by
 /// `taskbar::on_taskbar_created`; `main` kills it and calls `taskbar::on_reannounce_timer()`.
 pub const TIMER_TRAY_REANNOUNCE: usize = 9;
+
+/// 2 s on the dock window, ONLY while the bar is visible and the network and/or metrics module is
+/// on (`ui::sysmon_sync` arms and kills it): CPU/RAM sample, network query every few ticks.
+/// Handled by `ui`.
+pub const TIMER_SYSMON: usize = 10;
 
 // POPUP window timers (different hwnd from the dock's; handled only by `popup`).
 /// 15 ms: popup open fade and hover plate; off when idle.

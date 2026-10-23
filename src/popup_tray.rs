@@ -4,10 +4,11 @@
 //!    layout (`ui::tray_hidden_ids`, which also accounts for the width fallback) plus those that
 //!    the user hid (`tray_host::snapshot_all`, `user_hidden`). Left/right/double/
 //!    middle clicks are forwarded with `tray_host::click`; the popup closes before a left or right click
-//!    (the app menu must be able to take the foreground). The settings gear is the last grid cell.
+//!    (the app menu must be able to take the foreground).
 //!  * CUSTOMIZE: list of ALL tray apps (16 px icon, short name, pill toggle
 //!    "visible in the bar"). A click flips the choice (`tray_host::set_user_hidden`: atomic config
-//!    + immediate bar update) and the popup stays open. "Done" returns to the grid.
+//!    write and immediate bar update) and the popup stays open. "Done" returns to the grid, or closes the popup when
+//!    it was opened directly in this mode (`popup::next_tray_chooser`, from the Settings popup).
 
 use std::sync::Arc;
 
@@ -27,7 +28,6 @@ const MAX_COLS: usize = 6;
 /// Visible rows of the chooser list (scroll with the wheel beyond that).
 const MAX_ROWS: usize = 14;
 
-const ID_CUSTOMIZE: u32 = 100_000;
 const ID_DONE: u32 = 100_001;
 const ROW_BASE: u32 = 200_000;
 
@@ -52,6 +52,8 @@ pub(crate) struct TrayPopup {
     /// First row shown of "Customize" (scrolling).
     scroll: usize,
     customize: bool,
+    /// true if opened directly in CUSTOMIZE mode: "Done" closes the popup instead of showing the grid.
+    direct: bool,
     hits: HitMap,
     /// Click to forward after closing.
     pending: Option<(u64, TrayClick)>,
@@ -97,6 +99,24 @@ pub(crate) fn new() -> Box<dyn Content> {
         rows: Vec::new(),
         scroll: 0,
         customize: false,
+        direct: false,
+        hits: HitMap::default(),
+        pending: None,
+        icon: 16,
+        sep_y: 0,
+        width: 0,
+        empty_rc: None,
+    })
+}
+
+/// Creates the content directly in the "choose visible icons" mode (no overflow grid).
+pub(crate) fn new_chooser() -> Box<dyn Content> {
+    Box::new(TrayPopup {
+        cells: Vec::new(),
+        rows: customize_rows(),
+        scroll: 0,
+        customize: true,
+        direct: true,
         hits: HitMap::default(),
         pending: None,
         icon: 16,
@@ -137,19 +157,17 @@ impl Content for TrayPopup {
             y += m.px(32);
             return (w, y + pad);
         }
-        // The settings gear is the last slot of the grid, after the overflow icons.
         let n = self.cells.len();
-        let slots = n + 1;
+        let slots = n.max(1);
         let cols = slots.clamp(1, MAX_COLS) as i32;
         let rows = slots.div_ceil(MAX_COLS) as i32;
         // Grid aligned to the left: the first icon's edge falls on the text column (20).
         let gx = m.px(TEXT_COL) - (cell - self.icon) / 2;
         let w = 2 * gx + cols * cell;
         self.width = w;
-        for i in 0..slots {
+        for i in 0..n {
             let (c, r) = ((i % MAX_COLS) as i32, (i / MAX_COLS) as i32);
-            let id = if i < n { i as u32 } else { ID_CUSTOMIZE };
-            self.hits.add(id, rect_wh(gx + c * cell, pad + r * cell, cell, cell));
+            self.hits.add(i as u32, rect_wh(gx + c * cell, pad + r * cell, cell, cell));
         }
         self.sep_y = -1;
         (w, pad * 2 + rows * cell)
@@ -206,12 +224,6 @@ impl Content for TrayPopup {
                 s.blit(b, x, y, ic, 255);
             }
         }
-        if let Some(rc) = self.hits.rect(ID_CUSTOMIZE) {
-            let h = row_plate(s, rc, ID_CUSTOMIZE, hot, pressed);
-            let x = rc.left + ((rc.right - rc.left) - ic) / 2;
-            let y = rc.top + ((rc.bottom - rc.top) - ic) / 2;
-            s.glyph(x, y, ic, lift(TEXT2_ALPHA, h), &gear_shape);
-        }
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<u32> {
@@ -220,11 +232,7 @@ impl Content for TrayPopup {
 
     fn click(&mut self, id: u32) -> Reply {
         match id {
-            ID_CUSTOMIZE => {
-                self.customize = true;
-                self.rows = customize_rows();
-                Reply::Relayout
-            }
+            ID_DONE if self.direct => Reply::Close,
             ID_DONE => {
                 self.customize = false;
                 self.cells = overflow_cells();
@@ -248,7 +256,7 @@ impl Content for TrayPopup {
     }
 
     fn button(&mut self, id: u32, which: Button) -> Reply {
-        if self.customize || id >= ID_CUSTOMIZE {
+        if self.customize || id >= ID_DONE {
             return Reply::None;
         }
         let Some(cell) = self.cells.get(id as usize) else { return Reply::None };
@@ -298,18 +306,6 @@ impl Content for TrayPopup {
     }
 }
 
-/// Filled gear (8 teeth, centre hole) in the 16x16 glyph space.
-fn gear_shape(u: f32, v: f32) -> bool {
-    let (dx, dy) = (u - 8.0, v - 8.0);
-    let d = (dx * dx + dy * dy).sqrt();
-    if !(2.3..=7.0).contains(&d) {
-        return false;
-    }
-    // Body radius with a tooth every 45 degrees.
-    let tooth = (8.0 * dy.atan2(dx)).cos() > -0.15;
-    d <= if tooth { 7.0 } else { 5.6 }
-}
-
 /// Current cursor position (screen coordinates).
 fn cursor() -> POINT {
     let mut p = POINT::default();
@@ -335,6 +331,7 @@ pub(crate) fn preview_new(
             .collect(),
         scroll: 0,
         customize,
+        direct: false,
         hits: HitMap::default(),
         pending: None,
         icon: 16,

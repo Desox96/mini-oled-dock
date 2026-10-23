@@ -10,14 +10,16 @@
 //!    evaluated with 4x4 supersampling (no resources, no icon font).
 //!
 //! Style:
-//! bar height 36, radius 11, background RGBA(0,0,0,225), 1 px border RGBA(255,255,255,22), text
+//! bar height 36 (scaled by `bar_size`, see `bar_dpi`), radius 11, background black or dark grey at
+//! `bar_opacity` (default 95 %), 1 px border RGBA(255,255,255,22), text
 //! RGBA(255,255,255,230) "Segoe UI Variable Text" 13 px (fallback "Segoe UI"), secondary text
 //! RGBA(255,255,255,170), hover plate radius 7 (height 26, with a 1 px inner border), vertical separator 1 px wide, 16 high, RGBA(255,255,255,30),
 //! 16 px app icon centred with the name on `CONTENT_CY`, indicator: 2-high pill centred under the
 //! item content (icon and/or name): open = 50% of the content width at alpha 120, foreground = 75%
 //! at full white, attention = 75% orange; pinned and closed: none and the item at 70%. The
 //! open <-> foreground change is animated by the UI through `AppView::active_t`.
-//! Right zone: `sep | tray icons [chevron] | sep | bell, volume, clock, show desktop, power`.
+//! Right zone: `sep | tray icons [chevron] | sep | system modules` (metrics, bell, network, volume,
+//! clock, show desktop, power: only the visible ones, in `Scene::modules` order).
 //!
 //! Reordering: the UI hands `layout` the orders (`Scene::modules`; apps and tray icons arrive
 //! already sorted) and, during a drag, moves the rectangles of the zone being reordered; `paint` draws the
@@ -47,6 +49,8 @@ use crate::config::DisplayMode;
 use crate::glyphs;
 use crate::icons::IconBitmap;
 use crate::log;
+use crate::metrics::Usage;
+use crate::net::{NetKind, NetStatus};
 
 // ------------------------------------------------------------ logical measures
 
@@ -110,12 +114,14 @@ const SYS_ICON: i32 = 16;
 const SYS_TEXT_GAP: i32 = 4;
 /// Separator height (logical px).
 const SEP_HEIGHT: i32 = 16;
+/// Opacity (out of 255, relative to the glyph alpha) of the unlit Wi-Fi arcs.
+const NET_DIM_ALPHA: u32 = 80;
 /// Icon opacity of a pinned app without windows (idle / hover).
 const DIM_OPACITY: u32 = 178;
 const DIM_OPACITY_HOT: u32 = 230;
 
-// Colours (not premultiplied) and alpha.
-const BG_ALPHA: u32 = 242;
+// Colours (not premultiplied) and alpha. The background colour and alpha come from the config
+// (`background`, `bar_opacity`: `Config::bar_alpha`, 242 by default).
 const BORDER_ALPHA: u32 = 22;
 const TEXT_ALPHA: u32 = 230;
 const TEXT2_ALPHA: u32 = 170;
@@ -154,6 +160,19 @@ impl Metrics {
     }
 }
 
+/// DPI the bar is drawn at: the monitor DPI scaled by the configured `bar_size` (small 7/8, medium 1,
+/// large 5/4). Everything in the bar is laid out from `Metrics::px`, so height, icons (requested at the
+/// scaled size, never stretched), text and spacing stay proportional and crisp. Popups keep the monitor DPI.
+pub fn bar_dpi(monitor_dpi: u32, size: crate::config::BarSize) -> u32 {
+    use crate::config::BarSize;
+    let (num, den) = match size {
+        BarSize::Small => (7, 8),
+        BarSize::Medium => (1, 1),
+        BarSize::Large => (5, 4),
+    };
+    (monitor_dpi * num + den / 2) / den
+}
+
 impl Default for Metrics {
     fn default() -> Self {
         Metrics { dpi: 96 }
@@ -178,6 +197,10 @@ pub enum ItemId {
     ShowDesktop,
     /// Power button: opens the power popup.
     Power,
+    /// Network status (Wi-Fi bars / ethernet + internet badge): opens the network popup.
+    Network,
+    /// CPU / RAM usage (two small text lines).
+    Metrics,
 }
 
 /// Status indicator under the icon.
@@ -223,6 +246,10 @@ pub struct SystemView<'a> {
     pub bell_badge: bool,
     /// Crossed-out bell ("Do not disturb" active).
     pub bell_dnd: bool,
+    /// Network glyph state (`ItemId::Network`).
+    pub net: NetStatus,
+    /// CPU / RAM percentages (`ItemId::Metrics`).
+    pub usage: Usage,
 }
 
 /// A tray icon to draw (bitmap already at `Metrics::px(SYS_ICON)`).
@@ -233,35 +260,50 @@ pub struct TrayIcon<'a> {
     pub icon: &'a IconBitmap,
 }
 
-/// Names of the system modules in `config.modules_order`, with their items.
-pub const MODULES: [(&str, ItemId); 5] = [
+/// Names of the system modules in `config.modules_order`, with their items, in the default order
+/// (`config::DEFAULT_MODULES_ORDER`).
+pub const MODULES: [(&str, ItemId); 7] = [
+    ("metrics", ItemId::Metrics),
     ("notifications", ItemId::Notifications),
+    ("network", ItemId::Network),
     ("volume", ItemId::Volume),
     ("clock", ItemId::Clock),
     ("show_desktop", ItemId::ShowDesktop),
     ("power", ItemId::Power),
 ];
 
-/// Validated order of the system modules: names in `names` first (unknown and repeated ones are
-/// ignored), then the missing modules in the default order.
-pub fn modules_from_names(names: &[String]) -> [ItemId; 5] {
-    let mut out = [ItemId::Power; 5];
-    let mut n = 0;
+/// Validated order of ALL the system modules: names in `names` first (unknown and repeated ones are
+/// ignored), then each missing module right after its nearest preceding default neighbour that is
+/// placed (at the front if none), so a module added in a new version lands where it belongs.
+pub fn modules_from_names(names: &[String]) -> Vec<ItemId> {
+    let mut out: Vec<ItemId> = Vec::with_capacity(MODULES.len());
     for name in names {
         if let Some((_, id)) = MODULES.iter().find(|(m, _)| m.eq_ignore_ascii_case(name.trim())) {
-            if !out[..n].contains(id) {
-                out[n] = *id;
-                n += 1;
+            if !out.contains(id) {
+                out.push(*id);
             }
         }
     }
-    for (_, id) in MODULES {
-        if !out[..n].contains(&id) {
-            out[n] = id;
-            n += 1;
+    for (k, (_, id)) in MODULES.iter().enumerate() {
+        if out.contains(id) {
+            continue;
         }
+        let at = MODULES[..k]
+            .iter()
+            .rev()
+            .find_map(|(_, prev)| out.iter().position(|o| o == prev))
+            .map_or(0, |p| p + 1);
+        out.insert(at, *id);
     }
     out
+}
+
+/// The visible system modules, in order: `modules_from_names` without the ones switched off in the
+/// config (`Config::module_visible`; power is always visible).
+pub fn visible_modules(cfg: &crate::config::Config) -> Vec<ItemId> {
+    let mut v = modules_from_names(&cfg.modules_order);
+    v.retain(|id| module_name(*id).is_none_or(|n| cfg.module_visible(n)));
+    v
 }
 
 /// Config name of a system module item.
@@ -301,8 +343,8 @@ pub struct Scene<'a> {
     pub bar_top: bool,
     pub system: SystemView<'a>,
     pub plate: Option<Plate>,
-    /// Order of the system items (`modules_from_names`).
-    pub modules: [ItemId; 5],
+    /// Visible system items, in order (`visible_modules`).
+    pub modules: &'a [ItemId],
     /// Item being dragged (its rectangle in the layout already follows the cursor).
     pub lift: Option<Lift>,
     /// Item under the mouse (or of the open popup): text and glyphs brighten.
@@ -326,7 +368,7 @@ pub struct Layout {
     pub width: i32,
     /// Bar height in physical pixels (`Metrics::px(BAR_HEIGHT)`).
     pub height: i32,
-    /// Items in visual order: apps, tray icons, chevron, Notifications, Volume, Clock, ShowDesktop, Power.
+    /// Items in visual order: apps, tray icons, chevron, then the visible system modules.
     pub items: Vec<ItemRect>,
     /// X coordinate (client, physical px) of the separator between the app zone and the tray/system zone; -1 if absent
     /// (no apps).
@@ -647,6 +689,8 @@ struct SysWidths {
     clock: i32,
     desk: i32,
     power: i32,
+    net: i32,
+    metrics: i32,
 }
 
 fn sys_widths(scene: &Scene<'_>) -> SysWidths {
@@ -663,7 +707,43 @@ fn sys_widths(scene: &Scene<'_>) -> SysWidths {
     let tw = measure(sys.time, false, m).max(measure("00:00", false, m));
     let dw = sys.date.map(|d| measure(d, true, m)).unwrap_or(0);
     let clock = 2 * pad + tw.max(dw);
-    SysWidths { bell, volume, clock, desk: bell, power: bell }
+    // Metrics are measured only when the module is visible.
+    let metrics = if scene.modules.contains(&ItemId::Metrics) {
+        let label = measure(METRIC_LABELS[0], true, m).max(measure(METRIC_LABELS[1], true, m));
+        2 * pad + label + m.px(METRIC_GAP) + measure(metric_slot(sys.usage), true, m)
+    } else {
+        0
+    };
+    SysWidths { bell, volume, clock, desk: bell, power: bell, net: bell, metrics }
+}
+
+/// Labels of the two metric lines.
+const METRIC_LABELS: [&str; 2] = ["CPU", "RAM"];
+/// Gap between a metric label and its value (logical px).
+const METRIC_GAP: i32 = 4;
+/// Alpha of the metric labels (the values use the brighter secondary alpha).
+const METRIC_LABEL_ALPHA: u32 = 120;
+
+/// Width slot of the metric values: two digits usually, three only at 100% (like the volume).
+fn metric_slot(u: Usage) -> &'static str {
+    if u.cpu >= 100 || u.ram >= 100 {
+        "100%"
+    } else {
+        "88%"
+    }
+}
+
+/// Width of a system module item.
+fn module_width(sw: &SysWidths, id: ItemId) -> i32 {
+    match id {
+        ItemId::Notifications => sw.bell,
+        ItemId::Volume => sw.volume,
+        ItemId::Clock => sw.clock,
+        ItemId::ShowDesktop => sw.desk,
+        ItemId::Network => sw.net,
+        ItemId::Metrics => sw.metrics,
+        _ => sw.power,
+    }
 }
 
 /// Computes the layout (measures text with the current font; draws nothing).
@@ -756,10 +836,10 @@ fn build_layout(
     let tray_count = vis + usize::from(has_chev);
     let tray_block =
         if tray_count > 0 { vis as i32 * tray_w + if has_chev { chev_w } else { 0 } + 2 * zone_gap + sep_w } else { 0 };
-    let sys_total = sw.bell + sw.volume + sw.clock + sw.desk + sw.power;
+    let sys_total: i32 = scene.modules.iter().map(|id| module_width(sw, *id)).sum();
     let right_total = tray_block + sys_total;
 
-    let mut items = Vec::with_capacity(scene.apps.len() + tray_count + 5);
+    let mut items = Vec::with_capacity(scene.apps.len() + tray_count + scene.modules.len());
     let mut x = pad_bar;
     let mut napps = 0usize;
     for i in 0..scene.apps.len() {
@@ -803,14 +883,8 @@ fn build_layout(
         separator2_x = -1;
         tray_area = RECT { left: x, top, right: x, bottom };
     }
-    for id in scene.modules {
-        let w = match id {
-            ItemId::Notifications => sw.bell,
-            ItemId::Volume => sw.volume,
-            ItemId::Clock => sw.clock,
-            ItemId::ShowDesktop => sw.desk,
-            _ => sw.power,
-        };
+    for &id in scene.modules {
+        let w = module_width(sw, id);
         items.push(ItemRect { id, rect: RECT { left: x, top, right: x + w, bottom } });
         x += w;
     }
@@ -1023,17 +1097,19 @@ fn rr_cov(x: i32, y: i32, l: i32, t: i32, r: i32, b: i32, rad: i32) -> f32 {
     (rad as f32 + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0)
 }
 
-/// Bar background: black RGBA(0,0,0,190) with a white RGBA(255,255,255,22) border of `bw` px,
-/// antialiased rounded corners. Writes every pixel of `buf` (`w` x `h`): the pill is `pw`
-/// wide, starts at column `poff`, and everything outside it is zeroed.
-fn draw_bg(buf: &mut [u32], w: i32, h: i32, pw: i32, poff: i32, radius: i32, bw: i32) {
+/// Bar background: `rgb` at alpha `bg_alpha` (premultiplied here; text and icons are composited over it
+/// at their own full alpha) with a white RGBA(255,255,255,22) border of `bw` px, antialiased rounded
+/// corners. Writes every pixel of `buf` (`w` x `h`): the pill is `pw` wide, starts at column `poff`,
+/// and everything outside it is zeroed.
+#[allow(clippy::too_many_arguments)]
+fn draw_bg(buf: &mut [u32], w: i32, h: i32, pw: i32, poff: i32, radius: i32, bw: i32, rgb: (u32, u32, u32), bg_alpha: u32) {
     let px = |x: i32, y: i32| -> u32 {
         let outer = rr_cov(x, y, 0, 0, pw, h, radius);
         if outer <= 0.0 {
             return 0;
         }
         let inner = rr_cov(x, y, bw, bw, pw - bw, h - bw, radius - bw);
-        let base = argb((BG_ALPHA as f32 * outer + 0.5) as u32, 0, 0, 0);
+        let base = argb((bg_alpha as f32 * outer + 0.5) as u32, rgb.0, rgb.1, rgb.2);
         let ring = (outer - inner).max(0.0);
         let ba = (BORDER_ALPHA as f32 * ring + 0.5) as u32;
         over(base, white(ba))
@@ -1245,7 +1321,8 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
     let Some(main) = g.main.as_ref() else { return };
     let buf = dib_pixels(main);
     // The pill background is painted straight into the DIB (no heap copy).
-    draw_bg(buf, w, h, pw, poff, m.px(BAR_RADIUS), m.px(1).max(1));
+    let cfg = crate::config::get();
+    draw_bg(buf, w, h, pw, poff, m.px(BAR_RADIUS), m.px(1).max(1), cfg.background.rgb(), cfg.bar_alpha());
     let g: &Gfx = g;
     let mut cv = Canvas { buf, w, h };
 
@@ -1386,8 +1463,14 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                     let x = r.left + sys_pad;
                     let muted = vol.muted || !vol.available;
                     let waves = glyphs::waves_for(vol.level);
+                    // Headphone glyph while the default device is headphones/headset (muted keeps the speaker).
+                    let phones = !muted && crate::audio::default_is_headphone();
                     cv.vector(x, cy - sys_icon / 2, sys_icon, glyph_a, &|u, v| {
-                        glyphs::speaker_shape(u, v, waves, muted)
+                        if phones {
+                            glyphs::device_shape(u, v, crate::audio::DeviceKind::Headphones)
+                        } else {
+                            glyphs::speaker_shape(u, v, waves, muted)
+                        }
                     });
                     if scene.system.show_volume_percent && vol.available {
                         let s = format!("{}%", vol.level);
@@ -1425,6 +1508,37 @@ fn paint_inner(g: &mut Gfx, scene: &Scene<'_>, layout: &Layout) {
                 }
                 ItemId::ShowDesktop => cv.vector(gx, cy - sys_icon / 2, sys_icon, glyph_a, &glyphs::show_desktop_shape),
                 ItemId::Power => cv.vector(gx, cy - sys_icon / 2, sys_icon, glyph_a, &glyphs::power_shape),
+                ItemId::Network => {
+                    let net = scene.system.net;
+                    let gy = cy - sys_icon / 2;
+                    if net.kind == NetKind::Ethernet {
+                        cv.vector(gx, gy, sys_icon, glyph_a, &glyphs::ethernet_shape);
+                    } else {
+                        // Wi-Fi: every arc dim, the lit ones on top (offline: all dim).
+                        cv.vector(gx, gy, sys_icon, glyph_a * NET_DIM_ALPHA / 255, &|u, v| glyphs::wifi_shape(u, v, 4));
+                        if net.kind == NetKind::Wifi {
+                            cv.vector(gx, gy, sys_icon, glyph_a, &|u, v| glyphs::wifi_shape(u, v, net.bars));
+                        }
+                    }
+                    // Corner badge: small globe = internet reachable, small x = no internet / offline.
+                    let online = net.kind != NetKind::None && net.internet;
+                    cv.vector(gx, gy, sys_icon, glyph_a, &|u, v| glyphs::net_badge_shape(u, v, online));
+                }
+                ItemId::Metrics => {
+                    let u = scene.system.usage;
+                    let step = g.lh_small - m.px(2);
+                    let y0 = m.px(CLOCK_CY) - (step + g.lh_small) / 2 - m.px(CLOCK_UP_HALVES) / 2;
+                    let pad = m.px(CLOCK_PAD);
+                    let (la, va) = if hot { (TEXT2_ALPHA, TEXT_ALPHA_HOT) } else { (METRIC_LABEL_ALPHA, TEXT_ALPHA) };
+                    for (k, val) in [u.cpu, u.ram].into_iter().enumerate() {
+                        let y = y0 + k as i32 * step;
+                        draw_text(g, &mut cv, METRIC_LABELS[k], r.left + pad, y, true, la);
+                        // Values right-aligned on the item padding.
+                        let s = format!("{val}%");
+                        let vw = text_width(g, &s, true);
+                        draw_text(g, &mut cv, &s, r.right - pad - vw, y, true, va);
+                    }
+                }
             }
         }
     }

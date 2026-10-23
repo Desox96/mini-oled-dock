@@ -194,7 +194,14 @@ impl Content for AudioPopup {
                     if d.is_default {
                         s.glyph(x0, rc.top + ((rc.bottom - rc.top) - icon) / 2, icon, TEXT_ALPHA, &glyphs::check_shape);
                     }
-                    let tx = x0 + icon + m.px(8);
+                    // Form-factor icon after the check slot, name after the icon.
+                    let ix = x0 + icon + m.px(6);
+                    let kind = d.kind;
+                    let ia = if d.is_default { TEXT_ALPHA } else { TEXT2_ALPHA };
+                    s.glyph(ix, rc.top + ((rc.bottom - rc.top) - icon) / 2, icon, lift(ia, h), &|u, v| {
+                        glyphs::device_shape(u, v, kind)
+                    });
+                    let tx = ix + icon + m.px(8);
                     let name = s.ellipsize(&d.name, Font::Normal, rc.right - m.px(10) - tx);
                     let alpha = if d.is_default { TEXT_ALPHA } else { TEXT2_ALPHA };
                     s.text(&name, tx, center_y(&rc, lh), Font::Normal, WHITE, lift(alpha, h));

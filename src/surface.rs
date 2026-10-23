@@ -356,7 +356,7 @@ impl Surface {
         buf[i] = over(buf[i], src);
     }
 
-    /// Background panel over the whole DIB: black `PANEL_BG_ALPHA`, 1 px border `PANEL_BORDER_ALPHA`,
+    /// Background panel over the whole DIB: config `background` tone (black by default) at `PANEL_BG_ALPHA`, 1 px border `PANEL_BORDER_ALPHA`,
     /// antialiased `PANEL_RADIUS` corners, transparent outside the corners. Replaces all pixels.
     pub fn panel(&mut self) {
         let Some(main) = self.main.as_ref() else { return };
@@ -364,6 +364,7 @@ impl Surface {
         let buf = dib_pixels(main);
         let radius = self.metrics.px(PANEL_RADIUS);
         let bw = 1.max(self.metrics.px(1));
+        let (r, g, b) = crate::config::get().background.rgb();
         for y in 0..h {
             for x in 0..w {
                 let outer = rr_cov(x, y, 0, 0, w, h, radius);
@@ -373,7 +374,7 @@ impl Surface {
                     continue;
                 }
                 let inner = rr_cov(x, y, bw, bw, w - bw, h - bw, radius - bw);
-                let base = argb((PANEL_BG_ALPHA as f32 * outer + 0.5) as u32, 0, 0, 0);
+                let base = argb((PANEL_BG_ALPHA as f32 * outer + 0.5) as u32, r, g, b);
                 let ring = (outer - inner).max(0.0);
                 let ba = (PANEL_BORDER_ALPHA as f32 * ring + 0.5) as u32;
                 buf[i] = over(base, white(ba));

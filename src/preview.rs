@@ -17,13 +17,22 @@ use std::sync::Arc;
 
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
-use crate::audio::{OutputDevice, VolumeState};
-use crate::config::{Config, DisplayMode};
+use crate::audio::{DeviceKind, OutputDevice, VolumeState};
+use crate::config::{Background, BarSize, Config, DisplayMode};
 use crate::icons::{self, IconBitmap};
+use crate::metrics::Usage;
+use crate::net::{NetInfo, NetKind, NetStatus};
 use crate::notif::{self, NotifAccess, NotifItem, NotifState};
 use crate::popup::{Content, DataEvent};
 use crate::render::{self, AppView, Indicator, ItemId, Lift, Metrics, Plate, Scene, SystemView, TrayIcon};
 use crate::surface::Surface;
+
+thread_local! {
+    /// Bar style of the next `render_bar` (size, background, opacity %): the defaults except for the
+    /// style variants.
+    static STYLE: std::cell::Cell<(BarSize, Background, u8)> =
+        const { std::cell::Cell::new((BarSize::Medium, Background::Black, 95)) };
+}
 
 /// Rendered DPIs and file suffix (120 is the "main" file).
 const DPIS: [(u32, &str); 2] = [(120, ""), (96, "_96")];
@@ -236,13 +245,31 @@ fn mock_notifications() -> NotifState {
 }
 
 fn mock_outputs() -> Vec<OutputDevice> {
-    let dev =
-        |id: &str, name: &str, d: bool| OutputDevice { id: id.to_string(), name: name.to_string(), is_default: d };
+    let dev = |id: &str, name: &str, d: bool, kind: DeviceKind| OutputDevice {
+        id: id.to_string(),
+        name: name.to_string(),
+        is_default: d,
+        kind,
+    };
     vec![
-        dev("a", "Speakers (Realtek Audio)", true),
-        dev("b", "Headphones (Bluetooth WH-1000XM5)", false),
-        dev("c", "Monitor (NVIDIA High Definition Audio)", false),
+        dev("a", "Speakers (Realtek Audio)", true, DeviceKind::Speaker),
+        dev("b", "Headphones (Bluetooth WH-1000XM5)", false, DeviceKind::Headphones),
+        dev("c", "Headset (USB Gaming Headset)", false, DeviceKind::Headset),
+        dev("d", "Monitor (NVIDIA High Definition Audio)", false, DeviceKind::Display),
+        dev("e", "Line Out (Realtek Audio)", false, DeviceKind::LineOut),
+        dev("f", "Digital Output (S/PDIF)", false, DeviceKind::Digital),
     ]
+}
+
+/// Mock network: Wi-Fi with a good signal and internet.
+fn mock_net() -> NetInfo {
+    NetInfo {
+        kind: NetKind::Wifi,
+        name: "Casa-5G".to_string(),
+        signal: 72,
+        ipv4: "192.168.1.42".to_string(),
+        internet: true,
+    }
 }
 
 // ------------------------------------------------------------------ bar
@@ -276,9 +303,16 @@ fn render_bar(
     mode: DisplayMode,
     attention: Option<usize>,
     drag: bool,
+    net: NetStatus,
 ) -> Option<(i32, i32, Vec<u32>)> {
     // The renderer reads the display mode from the global config snapshot (in memory only, never saved).
-    crate::config::set(Config { display_mode: mode, ..Config::default() });
+    // The metrics module (off by default) is switched on so the preview shows every module.
+    let (bar_size, background, bar_opacity) = STYLE.with(|s| s.get());
+    let cfg = Config { display_mode: mode, show_metrics: true, bar_size, background, bar_opacity, ..Config::default() };
+    // The bar is drawn at the monitor DPI scaled by `bar_size`, exactly like `ui`.
+    let m = Metrics { dpi: render::bar_dpi(m.dpi, bar_size) };
+    let modules = render::visible_modules(&cfg);
+    crate::config::set(cfg);
     if let Err(e) = render::init(m) {
         eprintln!("preview: render::init failed: {e}");
         return None;
@@ -312,9 +346,11 @@ fn render_bar(
             date: Some("Fri 23 Oct"),
             bell_badge: true,
             bell_dnd: false,
+            net,
+            usage: Usage { cpu: 12, ram: 48 },
         },
         plate: None,
-        modules: render::modules_from_names(&Config::default().modules_order),
+        modules: &modules,
         lift: None,
         hover,
         max_width: m.px(1920 - 2 * render::EDGE_MARGIN),
@@ -342,6 +378,7 @@ fn render_bar(
 }
 
 /// Bar on a wallpaper, written to `file`.
+#[allow(clippy::too_many_arguments)] // preview helper: one flag per variant
 fn bar_png(
     dir: &Path,
     file: &str,
@@ -350,8 +387,9 @@ fn bar_png(
     mode: DisplayMode,
     attention: Option<usize>,
     drag: bool,
+    net: NetStatus,
 ) -> bool {
-    let Some((bw, bh, px)) = render_bar(m, hover, mode, attention, drag) else { return false };
+    let Some((bw, bh, px)) = render_bar(m, hover, mode, attention, drag, net) else { return false };
     let pad = m.px(48);
     let (cw, ch) = (bw + 2 * pad, bh + m.px(150));
     let by = m.px(render::EDGE_MARGIN);
@@ -425,7 +463,27 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             c
         }
         "popup_calendar" => crate::popup_calendar::new(),
+        "popup_network" => crate::popup_network::new(mock_net()),
+        "popup_network_offline" => crate::popup_network::new(NetInfo {
+            kind: NetKind::Ethernet,
+            name: "Ethernet".to_string(),
+            ipv4: "10.0.0.7".to_string(),
+            internet: false,
+            ..Default::default()
+        }),
         "popup_power" => crate::popup_power::new(),
+        "popup_settings" => crate::popup_settings::new(),
+        "popup_settings_dark" => {
+            crate::config::set(Config {
+                background: Background::Dark,
+                bar_size: BarSize::Large,
+                bar_opacity: 85,
+                show_metrics: true,
+                autohide: false,
+                ..Config::default()
+            });
+            crate::popup_settings::new()
+        }
         "popup_app" => crate::popup::popup_app::new(crate::popup::AppMenuInfo {
             key: "discord".to_string(),
             name: "Discord".to_string(),
@@ -433,7 +491,7 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             windows: 2,
             can_launch: true,
         }),
-        "popup_tray" | "popup_tray_gear" | "popup_tray_customize" => {
+        "popup_tray" | "popup_tray_customize" => {
             let ic = mock_icons(m);
             let bmps: Vec<Arc<IconBitmap>> = ic.tray.into_iter().map(Arc::new).collect();
             let cells = bmps.iter().enumerate().skip(TRAY_BAR).map(|(i, b)| (i as u64 + 1, Some(b.clone()))).collect();
@@ -467,6 +525,7 @@ pub fn run(dir: &str) -> i32 {
         return 1;
     }
     crate::calendar::set_preview(true);
+    let wifi = mock_net().status();
     let mut failures = 0;
     for (dpi, suffix) in DPIS {
         let m = Metrics { dpi };
@@ -476,8 +535,16 @@ pub fn run(dir: &str) -> i32 {
             ("bar_top_icon", DisplayMode::Icon),
             ("bar_top_text", DisplayMode::Text),
         ] {
-            failures +=
-                i32::from(!bar_png(dir, &format!("{name}{suffix}.png"), m, Some(ItemId::App(1)), mode, None, false));
+            failures += i32::from(!bar_png(
+                dir,
+                &format!("{name}{suffix}.png"),
+                m,
+                Some(ItemId::App(1)),
+                mode,
+                None,
+                false,
+                wifi,
+            ));
         }
         // Firefox (app 2) asks for attention: orange blinking bar (visible phase).
         failures += i32::from(!bar_png(
@@ -488,10 +555,55 @@ pub fn run(dir: &str) -> i32 {
             DisplayMode::IconText,
             Some(2),
             false,
+            wifi,
         ));
         // Mid-drag frame: Steam lifted over the gap that opened between Firefox and VS Code.
-        failures +=
-            i32::from(!bar_png(dir, &format!("bar_drag{suffix}.png"), m, None, DisplayMode::IconText, None, true));
+        failures += i32::from(!bar_png(
+            dir,
+            &format!("bar_drag{suffix}.png"),
+            m,
+            None,
+            DisplayMode::IconText,
+            None,
+            true,
+            wifi,
+        ));
+        // Network variants: ethernet without internet (hovered), offline Wi-Fi, weak Wi-Fi.
+        for (name, net, hover) in [
+            ("bar_net_ethernet", NetStatus { kind: NetKind::Ethernet, bars: 0, internet: false }, Some(ItemId::Network)),
+            ("bar_net_offline", NetStatus::default(), None),
+            ("bar_net_weak", NetStatus { kind: NetKind::Wifi, bars: 1, internet: true }, None),
+        ] {
+            failures += i32::from(!bar_png(
+                dir,
+                &format!("{name}{suffix}.png"),
+                m,
+                hover,
+                DisplayMode::Icon,
+                None,
+                false,
+                net,
+            ));
+        }
+        // Style variants: small and large bar, dark grey background at 70 % opacity.
+        for (name, style) in [
+            ("bar_size_small", (BarSize::Small, Background::Black, 95)),
+            ("bar_size_large", (BarSize::Large, Background::Black, 95)),
+            ("bar_dark_70", (BarSize::Medium, Background::Dark, 70)),
+        ] {
+            STYLE.with(|s| s.set(style));
+            failures += i32::from(!bar_png(
+                dir,
+                &format!("{name}{suffix}.png"),
+                m,
+                None,
+                DisplayMode::IconText,
+                None,
+                false,
+                wifi,
+            ));
+            STYLE.with(|s| s.set((BarSize::Medium, Background::Black, 95)));
+        }
         failures += i32::from(!bar_png(
             dir,
             &format!("bar_hover_tray{suffix}.png"),
@@ -500,18 +612,24 @@ pub fn run(dir: &str) -> i32 {
             DisplayMode::IconText,
             None,
             false,
+            wifi,
         ));
         // (name, index of the hovered control)
         for (name, nth) in [
             ("popup_notif", 1),
             ("popup_audio", 3),
             ("popup_calendar", 8),
-            ("popup_power", 1),
+            ("popup_network", 0),
+            ("popup_network_offline", 9),
+            ("popup_power", 4),
+            ("popup_settings", 3),
+            ("popup_settings_dark", 14),
             ("popup_app", 1),
             ("popup_tray", 1),
-            ("popup_tray_gear", 3),
             ("popup_tray_customize", 2),
         ] {
+            // Popups read the background tone from the config: every one starts from the defaults.
+            crate::config::set(Config::default());
             let ok = match make_popup(name, m) {
                 Some(c) => popup_png(dir, &format!("{name}{suffix}.png"), m, c, nth),
                 None => false,

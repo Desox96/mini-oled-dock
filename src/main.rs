@@ -42,13 +42,17 @@ mod hook;
 mod icons;
 mod logger;
 mod mem;
+mod metrics;
 mod msg;
+mod net;
 mod notif;
 mod popup;
 mod popup_audio;
 mod popup_calendar;
+mod popup_network;
 mod popup_notif;
 mod popup_power;
+mod popup_settings;
 mod popup_tray;
 mod power;
 mod preview;
@@ -90,7 +94,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use msg::{
     TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_HOUSEKEEPING, TIMER_POLL, TIMER_RAM, TIMER_RECONCILE,
-    TIMER_SECOND, TIMER_TRAY_REANNOUNCE, WM_DOCK_DIAG, WM_DOCK_NOTIF, WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST,
+    TIMER_SECOND, TIMER_TRAY_REANNOUNCE, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG, WM_DOCK_NOTIF, WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST,
     WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED, WM_DOCK_WINKEY,
 };
 
@@ -350,6 +354,10 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
         }
         WM_DOCK_POPUP_CLOSED => {
             ui::on_popup_closed();
+            LRESULT(0)
+        }
+        WM_DOCK_CONFIG_APPLY => {
+            ui::on_config_changed();
             LRESULT(0)
         }
         WM_DOCK_TASKBAR_EVENT => {
@@ -754,12 +762,16 @@ fn setup_and_loop(h: HWND) -> Result<(), String> {
     match shell_thread::start(h) {
         Ok(s) => {
             SHELL_THREAD.with(|c| *c.borrow_mut() = Some(s));
-            shell_thread::request(shell_thread::ShellRequest::VolumeRefresh);
+            if config::get().show_volume {
+                shell_thread::request(shell_thread::ShellRequest::VolumeRefresh);
+            }
         }
         Err(e) => log!("shell thread not started (no names/icons/audio): {e}"),
     }
     // WinRT notifications + "Do not disturb" (`notif` thread, non-blocking).
-    notif::start(h);
+    if config::get().show_notifications {
+        notif::start(h);
+    }
     // Tray host: only with the native taskbar hidden. Order: Explorer already hidden and at
     // the bottom of the Z-order -> host topmost and ready -> TaskbarCreated announcement (apps re-register with us).
     if taskbar::is_hidden() && config::get().show_tray {

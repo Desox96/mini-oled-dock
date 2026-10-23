@@ -192,6 +192,11 @@ pub fn start(ui_hwnd: HWND) {
     }
 }
 
+/// true if the thread was started and not stopped.
+pub fn is_started() -> bool {
+    lock(&CMD_TX).is_some()
+}
+
 /// Stops the thread (channel closed + wake-up, join for at most 1 s; if it is stuck in a WinRT call
 /// we proceed without joining). Idempotent. Called in `cleanup`.
 pub fn stop() {

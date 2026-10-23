@@ -108,6 +108,13 @@ pub enum ShellRequest {
     SetDefaultOutput { id: String },
     /// "Show desktop" (`IShellDispatch4::ToggleDesktop`, fallback Win+D with `INJECT_TAG`).
     ToggleDesktop,
+    /// Network module: query the active connection -> `ShellEvent::Network`. The first request
+    /// creates the `net::Querier` (libraries / COM object loaded on demand, see `net`).
+    NetworkQuery,
+    /// Network module switched off: drop the `net::Querier` (frees everything it loaded).
+    NetworkRelease,
+    /// Volume module disabled: shuts the `AudioController` down and drops it.
+    AudioRelease,
 }
 
 /// Shell thread -> UI results (via queue + `WM_DOCK_SHELL_READY`).
@@ -121,6 +128,8 @@ pub enum ShellEvent {
     /// active output devices (reply to `ListOutputs`/`SetDefaultOutput`, and
     /// spontaneously after `WM_SHELL_AUDIO_DEVICE_CHANGED`). Empty = none / error.
     AudioOutputs(Vec<audio::OutputDevice>),
+    /// Status of the active network connection (reply to `NetworkQuery`).
+    Network(crate::net::NetInfo),
 }
 
 /// Shell thread handle; passed to `stop`.
@@ -252,6 +261,8 @@ struct Shell {
     names: HashMap<String, String>,
     /// Requests received but not yet executed (non-`ResolveApp` ones take precedence).
     pending: VecDeque<ShellRequest>,
+    /// Network module state: `None` until the first `NetworkQuery` and after `NetworkRelease`.
+    net: Option<crate::net::Querier>,
 }
 
 fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
@@ -269,8 +280,7 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
     let _ = ready.send(tid);
     log!("shell thread started (COM STA)");
 
-    let mut shell = Shell { ui, audio: None, names: HashMap::new(), pending: VecDeque::new() };
-    shell.ensure_audio();
+    let mut shell = Shell { ui, audio: None, names: HashMap::new(), pending: VecDeque::new(), net: None };
 
     // SAFETY: thread timer (null hwnd, system-chosen id), no callback: it arrives as
     // WM_TIMER in the thread queue. Cancelled at the end.
@@ -300,7 +310,8 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
         // SAFETY: `timer` is the id returned by SetTimer on the same thread.
         let _ = unsafe { KillTimer(None, timer) };
     }
-    // Audio callback registrations must be cancelled before CoUninitialize.
+    // COM objects (audio callbacks, network list manager) must be released before CoUninitialize.
+    shell.net = None;
     if let Some(a) = shell.audio.take() {
         a.shutdown();
     }
@@ -313,8 +324,9 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
 
 impl Shell {
     /// Creates the `AudioController` if it does not exist yet (retries on every volume request).
+    /// Does nothing while the volume module is off: no COM object, no callbacks.
     fn ensure_audio(&mut self) {
-        if self.audio.is_some() {
+        if self.audio.is_some() || !crate::config::get().show_volume {
             return;
         }
         let hwnd = HWND(self.ui as *mut c_void);
@@ -399,13 +411,30 @@ impl Shell {
                 push_event(self.ui, ShellEvent::AudioOutputs(list));
             }
             ShellRequest::ToggleDesktop => toggle_desktop(),
+            ShellRequest::NetworkQuery => {
+                let info = self.net.get_or_insert_with(crate::net::Querier::new).query();
+                push_event(self.ui, ShellEvent::Network(info));
+            }
+            ShellRequest::NetworkRelease => self.net = None,
+            ShellRequest::AudioRelease => {
+                if let Some(a) = self.audio.take() {
+                    a.shutdown();
+                }
+            }
         }
     }
 
     // -------------------------------------------------------------- name and icon
 
     fn resolve_app(&mut self, r: ResolveApp) {
-        let name = self.resolve_name(&r);
+        let (name, overridden) = self.resolve_name(&r);
+        // Self-heal: a pin's stored name is only a fallback; keep it in sync with the live resolver
+        // (an explicit `names` override is the user's choice, never written into the pin).
+        if !overridden {
+            if let Err(e) = crate::config::sync_pinned_name(&r.key, &name) {
+                log!("shell: cannot update the stored name of '{}': {e}", r.key);
+            }
+        }
         push_event(self.ui, ShellEvent::AppName { key: r.key.clone(), name });
         let bitmap = resolve_icon(&r);
         if bitmap.is_none() {
@@ -415,17 +444,18 @@ impl Shell {
     }
 
     /// Config override, then in-memory cache, then resolution (AppsFolder, FileDescription, stem).
-    fn resolve_name(&mut self, r: &ResolveApp) -> String {
+    /// The flag is true when the name comes from a `names` override.
+    fn resolve_name(&mut self, r: &ResolveApp) -> (String, bool) {
         if let Some(o) = override_name(&crate::config::get().names, r) {
-            return o;
+            return (o, true);
         }
         if let Some(n) = self.names.get(&r.key) {
-            return n.clone();
+            return (n.clone(), false);
         }
         let (n, step) = natural_name(r);
         log!("shell: name for '{}' = '{n}' ({step})", r.key);
         self.names.insert(r.key.clone(), n.clone());
-        n
+        (n, false)
     }
 }
 

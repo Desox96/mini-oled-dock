@@ -33,6 +33,38 @@ pub enum DisplayMode {
     Text,
 }
 
+/// Bar size: scales height, icons, text and spacing together (see `render::bar_dpi`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BarSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+}
+
+/// Background tone of the bar and the popups: pure black (OLED) or a very dark grey.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Background {
+    #[default]
+    Black,
+    Dark,
+}
+
+impl Background {
+    /// Background colour (not premultiplied).
+    pub fn rgb(self) -> (u32, u32, u32) {
+        match self {
+            Background::Black => (0, 0, 0),
+            Background::Dark => (28, 28, 30),
+        }
+    }
+}
+
+/// Opacity steps offered by the Settings popup (percent of the bar background).
+pub const OPACITY_STEPS: [u8; 4] = [100, 95, 85, 70];
+
 /// An app pinned to the dock.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default)]
@@ -63,8 +95,24 @@ pub struct Config {
     pub show_volume_percent: bool,
     /// hosts the tray icons of other apps in the dock (`tray_host`). false = never started.
     pub show_tray: bool,
+    /// Per-module visibility of the system modules (see `MODULE_NAMES` / `module_visible`).
+    /// A hidden module is not laid out and costs nothing: no timer, no polling, nothing loaded.
+    pub show_notifications: bool,
+    pub show_volume: bool,
+    /// Network module: Wi-Fi / ethernet glyph with internet state, popup with the details (`net`).
+    pub show_network: bool,
+    /// CPU / RAM usage module (`metrics`).
+    pub show_metrics: bool,
+    pub show_clock: bool,
+    pub show_desktop_button: bool,
     /// Entry display: "icon_text" | "icon" | "text".
     pub display_mode: DisplayMode,
+    /// Bar size: "small" | "medium" | "large".
+    pub bar_size: BarSize,
+    /// Background tone: "black" | "dark".
+    pub background: Background,
+    /// Opacity of the bar background in percent (50..=100; text and icons stay fully opaque).
+    pub bar_opacity: u8,
     /// Clock picture for GetTimeFormatEx (default "HH:mm").
     pub time_format: String,
     /// If true and `time_format` has no "s", ":ss" is appended.
@@ -84,8 +132,9 @@ pub struct Config {
     pub app_order: Vec<String>,
     /// Order of the tray icons (same key as `tray_hidden`). Unknown icons go last, in registration order.
     pub tray_order: Vec<String>,
-    /// Order of the system modules: "notifications", "volume", "clock", "show_desktop", "power".
-    /// Validated on use: missing modules are appended, unknown names are ignored.
+    /// Order of the system modules: "metrics", "notifications", "network", "volume", "clock",
+    /// "show_desktop", "power". Validated on use (`render::modules_from_names`): unknown names are
+    /// ignored, a missing module goes back next to its default neighbour.
     pub modules_order: Vec<String>,
     /// true once the `notif` thread has already asked for notification access once
     /// (`RequestAccessAsync`): the prompt is not shown again on every start.
@@ -97,7 +146,8 @@ pub const APP_ORDER_CAP: usize = 64;
 pub const TRAY_ORDER_CAP: usize = 128;
 
 /// Default order of the system modules (names accepted by `modules_order`).
-pub const DEFAULT_MODULES_ORDER: [&str; 5] = ["notifications", "volume", "clock", "show_desktop", "power"];
+pub const DEFAULT_MODULES_ORDER: [&str; 7] =
+    ["metrics", "notifications", "network", "volume", "clock", "show_desktop", "power"];
 
 /// GUIDs of the system tray icons hidden by default: volume, network, power, location,
 /// microphone (the dock draws/duplicates the first three).
@@ -120,7 +170,16 @@ impl Default for Config {
             show_date: true,
             show_volume_percent: true,
             show_tray: true,
+            show_notifications: true,
+            show_volume: true,
+            show_network: true,
+            show_metrics: false,
+            show_clock: true,
+            show_desktop_button: true,
             display_mode: DisplayMode::IconText,
+            bar_size: BarSize::Medium,
+            background: Background::Black,
+            bar_opacity: 95,
             time_format: "HH:mm".to_string(),
             show_seconds: false,
             date_format: "ddd d MMM".to_string(),
@@ -261,6 +320,15 @@ fn render(c: &Config) -> String {
         Position::Top => "top",
         Position::Bottom => "bottom",
     };
+    let size = match c.bar_size {
+        BarSize::Small => "small",
+        BarSize::Medium => "medium",
+        BarSize::Large => "large",
+    };
+    let bg = match c.background {
+        Background::Black => "black",
+        Background::Dark => "dark",
+    };
     format!(
         r#"{TEMPLATE_MARK}
 // Edit and save: changes are picked up within ~2 seconds, no restart needed.
@@ -276,6 +344,16 @@ fn render(c: &Config) -> String {
   // What each entry shows: "icon_text" (icon + name), "icon" (icon only) or "text" (name only).
   // The indicator bar under each entry adapts to the chosen mode.
   "display_mode": "{mode}",
+
+  // Size of the bar: "small", "medium" or "large". Height, icons, text and spacing scale together.
+  "bar_size": "{size}",
+
+  // Background of the bar and the popups: "black" (pure #000, ideal for OLED) or "dark" (very dark grey).
+  "background": "{bg}",
+
+  // Opacity of the bar background in percent, 50-100 (the Settings popup offers 100, 95, 85, 70).
+  // Text and icons always stay fully opaque.
+  "bar_opacity": {opacity},
 
   // Hide the bar when the pointer leaves it, show it when you touch the screen edge.
   "autohide": {autohide},
@@ -310,6 +388,24 @@ fn render(c: &Config) -> String {
   // the bar widens and narrows dynamically.
   "show_tray": {show_tray},
 
+  // System modules on the right of the bar: true = shown, false = removed from the bar.
+  // A hidden module costs nothing (no timer, no polling, no system library loaded).
+  // The power button is always shown (it holds the dock's own menu).
+  "show_notifications": {show_notif},
+  "show_volume": {show_vol_mod},
+
+  // Network: Wi-Fi signal bars or ethernet glyph, with a small globe when the internet is reachable
+  // and a small x when it is not. Click for the connection details. Refreshed every ~6 s while
+  // the bar is visible.
+  "show_network": {show_network},
+
+  // CPU and RAM usage in percent (two small lines). Refreshed every 2 s while the bar is visible.
+  // Click to open Task Manager.
+  "show_metrics": {show_metrics},
+
+  "show_clock": {show_clock},
+  "show_desktop_button": {show_desk},
+
   // Tray icons you chose to keep out of the bar (they stay in the tray popup).
   // Normally managed from the tray popup. A key is the icon's GUID (lowercase, no braces)
   // or "<exe name lowercase>#<icon id>", e.g. "discord.exe#1".
@@ -324,7 +420,8 @@ fn render(c: &Config) -> String {
 
   // Pinned apps, in order. Normally managed with Pin/Unpin in the app menu. Fields:
   //   "key"    grouping key: the AUMID, or the lowercase exe path
-  //   "name"   label shown in the dock
+  //   "name"   fallback label, refreshed automatically from the app itself; use the "names"
+  //            map to set a fixed label
   //   "launch" exe path, or "shell:AppsFolder\\<AUMID>" for Store/packaged apps
   //   "icon"   optional custom icon: plain PNG file name inside %ProgramData%\mini-oled-dock\icons\
   //            (e.g. "discord.png"; paths, "..", drive letters and UNC paths are rejected)
@@ -337,8 +434,9 @@ fn render(c: &Config) -> String {
   "app_order": {app_order},
 
   // Order of the system buttons on the right of the bar. Normally managed by dragging them.
-  // Names: "notifications", "volume", "clock", "show_desktop", "power". Missing names are appended
-  // in the default order, unknown names are ignored.
+  // Names: "metrics", "notifications", "network", "volume", "clock", "show_desktop", "power".
+  // Missing names go back next to their default neighbour, unknown names are ignored.
+  // Hiding a module (the show_* switches above) keeps its place in this list.
   "modules_order": {modules_order},
 
   // Display-name overrides. Key = exe file name lowercase (e.g. "code.exe") or AUMID;
@@ -349,6 +447,7 @@ fn render(c: &Config) -> String {
   "notif_prompted": {notif}
 }}
 "#,
+        opacity = c.bar_opacity,
         autohide = c.autohide,
         hide_native = c.hide_native_taskbar,
         show_date = c.show_date,
@@ -357,6 +456,12 @@ fn render(c: &Config) -> String {
         date_format = js(&c.date_format),
         show_volume = c.show_volume_percent,
         show_tray = c.show_tray,
+        show_notif = c.show_notifications,
+        show_vol_mod = c.show_volume,
+        show_network = c.show_network,
+        show_metrics = c.show_metrics,
+        show_clock = c.show_clock,
+        show_desk = c.show_desktop_button,
         tray_hidden = js_block(&c.tray_hidden),
         tray_order = js_block(&c.tray_order),
         app_order = js_block(&c.app_order),
@@ -463,6 +568,13 @@ fn report_legacy_dir() {
     }
 }
 
+/// true if the file's mtime differs from the one remembered at our last read/write (a hand edit that
+/// `poll_changed` has not loaded yet). Does not consume the change.
+pub fn external_edit_pending() -> bool {
+    let Some(path) = crate::datadir::config_path() else { return false };
+    file_mtime(&path) != *lock_mtime()
+}
+
 /// Checks the mtime of `config.json`; if it changed, re-reads, updates the global snapshot and
 /// returns `true` (the UI must rebuild its entries). Does not block: one stat + read of a
 /// small file. Called by the UI thread every 2 s (`TIMER_HOUSEKEEPING`).
@@ -564,6 +676,59 @@ fn write_file(c: &Config) -> Result<(), String> {
     Ok(())
 }
 
+// ------------------------------------------------------------- module visibility
+
+/// Names accepted by `Config::module_visible` / `set_module_visible`: the `modules_order` names
+/// plus "tray" (`show_tray`). The power button is not listed: it is always shown.
+pub const MODULE_NAMES: [&str; 7] = ["notifications", "volume", "network", "metrics", "clock", "show_desktop", "tray"];
+
+impl Config {
+    fn module_flag(&mut self, name: &str) -> Option<&mut bool> {
+        Some(match name {
+            "notifications" => &mut self.show_notifications,
+            "volume" => &mut self.show_volume,
+            "network" => &mut self.show_network,
+            "metrics" => &mut self.show_metrics,
+            "clock" => &mut self.show_clock,
+            "show_desktop" => &mut self.show_desktop_button,
+            "tray" => &mut self.show_tray,
+            _ => return None,
+        })
+    }
+
+    /// true if module `name` (a `MODULE_NAMES` entry, or "power") is shown. Unknown names: true.
+    pub fn module_visible(&self, name: &str) -> bool {
+        match name {
+            "notifications" => self.show_notifications,
+            "volume" => self.show_volume,
+            "network" => self.show_network,
+            "metrics" => self.show_metrics,
+            "clock" => self.show_clock,
+            "show_desktop" => self.show_desktop_button,
+            "tray" => self.show_tray,
+            _ => true,
+        }
+    }
+
+    /// Shows/hides module `name` (a `MODULE_NAMES` entry). false if the name is unknown.
+    pub fn set_module_visible(&mut self, name: &str, on: bool) -> bool {
+        match self.module_flag(name) {
+            Some(f) => {
+                *f = on;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl Config {
+    /// Bar background alpha (0..=255) from `bar_opacity`, clamped to 50..=100 %.
+    pub fn bar_alpha(&self) -> u32 {
+        (self.bar_opacity.clamp(50, 100) as u32 * 255 + 50) / 100
+    }
+}
+
 // ------------------------------------------------------------------ pin / unpin
 
 impl Config {
@@ -587,6 +752,30 @@ pub fn pin(app: PinnedApp) -> Result<(), String> {
             c.pinned.push(app);
         }
     })
+}
+
+/// Updates the stored display name of the pin `key` (fallback name) when it differs from `name`
+/// (the live resolver's result). No pin, empty `name` or same name: nothing is written.
+pub fn sync_pinned_name(key: &str, name: &str) -> Result<(), String> {
+    if name.trim().is_empty() || !pinned_name_differs(&get(), key, name) {
+        return Ok(());
+    }
+    // A hand edit not yet picked up by `poll_changed` would be overwritten by the in-memory snapshot:
+    // skip, the self-heal runs again at the next resolve.
+    if external_edit_pending() {
+        return Ok(());
+    }
+    modify(|c| set_pinned_name(c, key, name))
+}
+
+fn pinned_name_differs(c: &Config, key: &str, name: &str) -> bool {
+    c.pinned_index(key).is_some_and(|i| c.pinned[i].name != name)
+}
+
+fn set_pinned_name(c: &mut Config, key: &str, name: &str) {
+    if let Some(i) = c.pinned_index(key) {
+        c.pinned[i].name = name.to_string();
+    }
 }
 
 /// Removes the pin with this key and saves. If it does not exist nothing is written (Ok).
@@ -643,8 +832,11 @@ mod tests {
         c.show_seconds = true;
         c.display_mode = DisplayMode::Text;
         c.position = Position::Top;
+        c.bar_size = BarSize::Large;
+        c.background = Background::Dark;
+        c.bar_opacity = 70;
         let r = render(&c);
-        assert!(r.contains("Get-StartApps"));
+        assert!(r.contains("Get-StartApps") && r.contains("\"bar_size\": \"large\""));
         assert_eq!(parse(&r).unwrap(), c);
         assert_eq!(parse(&render(&Config::default())).unwrap(), Config::default());
     }
@@ -658,7 +850,47 @@ mod tests {
         let r = render(&c);
         assert!(r.contains("\"modules_order\""));
         assert_eq!(parse(&r).unwrap(), c);
-        assert_eq!(Config::default().modules_order.len(), 5);
+        assert_eq!(Config::default().modules_order.len(), 7);
+    }
+
+    #[test]
+    fn module_visibility() {
+        let mut c = Config::default();
+        assert!(c.module_visible("network") && !c.module_visible("metrics") && c.module_visible("power"));
+        for n in MODULE_NAMES {
+            assert!(c.set_module_visible(n, false));
+            assert!(!c.module_visible(n));
+        }
+        assert!(!c.set_module_visible("power", false));
+        c.show_metrics = true;
+        c.show_desktop_button = false;
+        let r = render(&c);
+        assert!(r.contains("\"show_network\"") && r.contains("\"show_desktop_button\": false"));
+        assert_eq!(parse(&r).unwrap(), c);
+    }
+
+    #[test]
+    fn pinned_name_sync() {
+        let mut c = Config::default();
+        c.pinned.push(PinnedApp { key: "Stremio".into(), name: "Freedom to Stream".into(), ..Default::default() });
+        assert!(pinned_name_differs(&c, "stremio", "Stremio"));
+        assert!(!pinned_name_differs(&c, "stremio", "Freedom to Stream"));
+        assert!(!pinned_name_differs(&c, "other", "Stremio"));
+        set_pinned_name(&mut c, "stremio", "Stremio");
+        assert_eq!(c.pinned[0].name, "Stremio");
+        assert!(!pinned_name_differs(&c, "stremio", "Stremio"));
+    }
+
+    #[test]
+    fn bar_alpha_is_clamped() {
+        let mut c = Config::default();
+        assert_eq!(c.bar_alpha(), 242);
+        c.bar_opacity = 100;
+        assert_eq!(c.bar_alpha(), 255);
+        c.bar_opacity = 10;
+        assert_eq!(c.bar_alpha(), 128);
+        c.bar_opacity = 200;
+        assert_eq!(c.bar_alpha(), 255);
     }
 
     #[test]

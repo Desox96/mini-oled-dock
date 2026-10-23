@@ -12,17 +12,26 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 |---|---|---|
 | ![](docs/screenshots/popup_notif.png) | ![](docs/screenshots/popup_audio.png) | ![](docs/screenshots/popup_calendar.png) |
 
-| Power | Tray: choose visible icons |
-|---|---|
-| ![](docs/screenshots/popup_power.png) | ![](docs/screenshots/popup_tray_customize.png) |
+| Power | Settings | Network |
+|---|---|---|
+| ![](docs/screenshots/popup_power.png) | ![](docs/screenshots/popup_settings.png) | ![](docs/screenshots/popup_network.png) |
+
+| Tray: choose visible icons |
+|---|
+| ![](docs/screenshots/popup_tray_customize.png) |
 
 ## Features
 
 - Centred bar sized to its content: pinned apps first, then open apps. An underline marks open windows (orange when an app asks for attention).
 - Display modes: icon + name, icon only, or name only.
+- Three bar sizes (height, icons and text scale together), pure black or dark grey background, adjustable background opacity.
+- **Settings popup** (from the power button): every option above, auto-hide, clock seconds and the visible modules, applied live.
+- Network module: Wi-Fi signal bars or ethernet, with a small globe when the internet is reachable (an x when it is not); click for name, IPv4 and signal.
+- System metrics module (off by default): CPU and RAM usage in percent; click opens Task Manager.
 - Drag and drop reordering of apps, tray icons and system modules.
 - Tray icon hosting, with an overflow popup and a view to choose which icons are visible.
-- Popups: notifications (with Do not disturb), audio (volume, mute, output device), calendar, power, and an app menu (new window, pin / unpin, close).
+- Popups: notifications (with Do not disturb), audio (volume, mute, output device), calendar, network, power, settings, and an app menu (new window, pin / unpin, close).
+- Disabled features cost nothing: a hidden module has no timer, no polling and loads no system library; the network and metrics modules are polled only while the bar is visible.
 - Show desktop button.
 - **Win key toggles the dock** (Win+other-key shortcuts still work), including over fullscreen games.
 - Auto-hide with a slide animation: the bar shows on the Win key or when the pointer touches the screen edge, and hides after 2.5 s.
@@ -61,6 +70,9 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 - **Show / hide:** Win key alone, or the screen edge.
 - **App entries:** left click activates, minimises or cycles windows; middle click starts a new instance; right click opens the app menu.
 - **Volume:** wheel changes it, middle click mutes, left click opens the audio popup.
+- **Network:** left click opens the network popup (connection, internet, IPv4, signal, "Network settings"); right click opens Windows' network settings.
+- **System metrics:** click opens Task Manager.
+- **Settings:** power button, then **Settings**: position, display mode, size, background, opacity, auto-hide, clock seconds, one switch per module, and **Choose tray icons** (which tray icons stay in the bar). Every change applies at once and is saved to `config.json` (the comments are kept).
 - **Exit:** `Ctrl+Alt+Q`, or the power popup, or `dock.exe --restore`.
 
 ## Configuration
@@ -73,12 +85,18 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 |---|---|---|
 | `position` | `"bottom"` | `"top"` or `"bottom"` |
 | `display_mode` | `"icon_text"` | `"icon_text"`, `"icon"` or `"text"` |
+| `bar_size` | `"medium"` | `"small"`, `"medium"` or `"large"`: height, icons, text and spacing scale together |
+| `background` | `"black"` | `"black"` (pure #000, OLED) or `"dark"` (very dark grey); also used by the popups |
+| `bar_opacity` | `95` | Bar background opacity in percent, 50-100 (text and icons stay opaque) |
 | `autohide` | `true` | Hide the bar when the pointer leaves it |
 | `hide_native_taskbar` | `true` | Hide the Windows taskbar while the dock runs |
 | `show_date` / `date_format` | `true` / `"ddd d MMM"` | Date under the time (Windows date picture) |
 | `time_format` / `show_seconds` | `"HH:mm"` / `false` | Clock format (Windows time picture) |
 | `show_volume_percent` | `true` | Show `NN%` next to the speaker |
-| `show_tray` | `true` | Host other apps' tray icons |
+| `show_tray` | `true` | Host other apps' tray icons (switching it off stops the tray host; the icons go back to Explorer) |
+| `show_network` | `true` | Network module: Wi-Fi bars / ethernet, internet badge, details popup |
+| `show_metrics` | `false` | CPU / RAM usage module (click opens Task Manager) |
+| `show_notifications` / `show_volume` / `show_clock` / `show_desktop_button` | `true` | Show the other system modules (a hidden module costs nothing) |
 | `pinned` | `[]` | Pinned apps, in display order |
 | `names` | `{}` | Display-name overrides (key: lowercase exe name or AUMID) |
 

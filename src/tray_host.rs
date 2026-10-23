@@ -867,6 +867,11 @@ fn stop_forwarder(fwd: Option<JoinHandle<()>>) {
     }
 }
 
+/// true if the host thread is running (even if it yielded to Explorer): `stop` has something to stop.
+pub fn is_started() -> bool {
+    RUNNING.load(Relaxed)
+}
+
 /// true if the host window exists and is active (not yielded).
 pub fn is_running() -> bool {
     RUNNING.load(Relaxed) && !YIELDED.load(Relaxed)
@@ -914,6 +919,27 @@ pub fn snapshot_all() -> Vec<TrayView> {
     collect(true)
 }
 
+/// true if at least one icon that would otherwise be shown is hidden by the user (the bar shows the
+/// "hidden icons" chevron for it). Same filters as `collect`; allocates (keys), so call it on state changes, not per frame.
+pub fn any_user_hidden() -> bool {
+    let cfg = crate::config::get();
+    if cfg.tray_hidden.is_empty() {
+        return false;
+    }
+    let st = state();
+    st.items.iter().filter(|t| is_visible_item(t) && !guid_hidden(&cfg, t)).any(|t| user_hidden_in(&cfg, &item_key(t)))
+}
+
+fn guid_hidden(cfg: &crate::config::Config, t: &TrayItem) -> bool {
+    match &t.guid {
+        Some(g) => {
+            let s = guid_string(g);
+            cfg.tray_hidden_guids.iter().any(|h| h.eq_ignore_ascii_case(&s))
+        }
+        None => false,
+    }
+}
+
 /// Builds the views; with `include_hidden == false` user-hidden icons are skipped BEFORE the
 /// view is built (no bitmap Arc clone / String copies for them). No cap on the count.
 fn collect(include_hidden: bool) -> Vec<TrayView> {
@@ -922,13 +948,7 @@ fn collect(include_hidden: bool) -> Vec<TrayView> {
     st.items
         .iter()
         .filter(|t| is_visible_item(t))
-        .filter(|t| match &t.guid {
-            Some(g) => {
-                let s = guid_string(g);
-                !cfg.tray_hidden_guids.iter().any(|h| h.eq_ignore_ascii_case(&s))
-            }
-            None => true,
-        })
+        .filter(|t| !guid_hidden(&cfg, t))
         .filter_map(|t| {
             let hidden = user_hidden_in(&cfg, &item_key(t));
             (include_hidden || !hidden).then(|| view_of(t, hidden))
