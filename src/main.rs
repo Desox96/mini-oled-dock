@@ -6,7 +6,8 @@
 //!  1. UI (main): layered window, message loop, timers, render, apps, taskbar (WinEvent),
 //!     ui. Has COM STA initialized (needed by `apps::window_identity`).
 //!  2. `hook`: WH_KEYBOARD_LL, just a message loop (keep it minimal: it must never block).
-//!  3. `log`: writes to (stdout only with `--console` and) `%LOCALAPPDATA%\Dock\dock.log` (`logger`).
+//!  3. `log`: writes to (stdout only with `--console` and) `%ProgramData%\mini-oled-dock\dock.log`
+//!     (`logger`; data folder security in `datadir`).
 //!  4. `shell`: COM STA for names/icons/audio/launch (`shell_thread`).
 //!  5. `stop-watch`: waits for the stop event of `--restore` (`watchdog`).
 //!  6. Thread created by Windows for Ctrl+C: only `PostMessageW(WM_CLOSE)`.
@@ -35,6 +36,7 @@ mod autostart;
 mod calendar;
 mod clock;
 mod config;
+mod datadir;
 mod glyphs;
 mod hook;
 mod icons;
@@ -817,6 +819,18 @@ fn usage() {
     );
 }
 
+/// Sets up the data folder (`datadir::init`: elevated = create/verify/repair) and then starts the
+/// logger; the folder diagnostics are logged as the first lines. `--preview` and `--list-apps` do
+/// not call this, so they never create or touch the data folder.
+fn start_logging(tag: &'static str) -> (Option<JoinHandle<()>>, Vec<String>) {
+    let notes = datadir::init();
+    let handle = logger::start(tag);
+    for n in &notes {
+        log!("{n}");
+    }
+    (handle, notes)
+}
+
 fn main() -> std::process::ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
@@ -844,7 +858,7 @@ fn main() -> std::process::ExitCode {
     }
     // Watchdog mode: no window, no hook; log with tag "wd".
     if let Some((pid, event)) = &args.watchdog {
-        let log_thread = logger::start("wd");
+        let (log_thread, _) = start_logging("wd");
         let code = watchdog::run_watchdog(*pid, event);
         logger::stop(log_thread);
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
@@ -856,7 +870,11 @@ fn main() -> std::process::ExitCode {
         if !has_console {
             logger::buffer_say();
         }
-        let log_thread = logger::start("");
+        let (log_thread, notes) = start_logging("");
+        // The installer is where a refused (e.g. squatted) data folder must be visible to the user.
+        for n in notes.iter().filter(|n| !n.starts_with("data: created")) {
+            logger::say(n);
+        }
         let code = if args.install { autostart::run_install_cli() } else { autostart::run_uninstall_cli() };
         logger::stop(log_thread);
         if !has_console {
@@ -875,7 +893,7 @@ fn main() -> std::process::ExitCode {
         if attach_console() {
             logger::enable_stdout();
         }
-        let log_thread = logger::start("");
+        let (log_thread, _) = start_logging("");
         let code = taskbar::run_restore_cli();
         logger::stop(log_thread);
         return std::process::ExitCode::from(code.clamp(0, 255) as u8);
@@ -884,15 +902,15 @@ fn main() -> std::process::ExitCode {
     if args.console && attach_console() {
         logger::enable_stdout();
     }
-    let log_thread = logger::start("");
     // Single instance: a second instance would mistake the taskbar hidden by the first for a dead
-    // run (self-heal) and would share the state file. Exits before touching anything,
-    // without the final `taskbar::restore()` (which would restore the first instance's taskbar).
+    // run (self-heal) and would share the state file. Exits before touching anything (data folder
+    // included: `datadir::init` runs only once the mutex is ours), without the final
+    // `taskbar::restore()` (which would restore the first instance's taskbar).
     if !watchdog::acquire_single_instance() {
-        log!("another dock instance is already running: exiting");
-        logger::stop(log_thread);
+        datadir::debug_out("another dock instance is already running: exiting");
         return std::process::ExitCode::FAILURE;
     }
+    let (log_thread, _) = start_logging("");
     if args.autostart {
         autostart::warn_if_not_installed();
         wait_for_shell();

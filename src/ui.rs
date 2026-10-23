@@ -182,7 +182,7 @@ struct Entry {
     launch: Option<String>,
     exe_path: String,
     aumid: Option<String>,
-    /// Custom icon of the pin (relative to `icons_dir()`).
+    /// Custom icon of the pin (plain name inside `datadir::icons_dir()`).
     custom_icon: Option<String>,
     /// Group of current windows (empty = no windows).
     windows: Vec<isize>,

@@ -3,10 +3,12 @@
 //! Callers (`log!`) format the line and send it to an unbounded channel: they never block.
 //! A dedicated `log` thread writes it to stdout (ONLY if `enable_stdout`: the exe uses the windows
 //! subsystem, so it has no console) and (append, flush on every line) to
-//! `%LOCALAPPDATA%\Dock\dock.log`. When the file exceeds `MAX_LOG_BYTES` (2 MB) it is
+//! `%ProgramData%\mini-oled-dock\dock.log` (admin-only folder, see `datadir`; opened without
+//! following reparse points). When the file exceeds `MAX_LOG_BYTES` (2 MB) it is
 //! renamed to `dock.log.1` (replacing the previous one) and a new file is opened.
-//! If the file cannot be opened, only stdout remains. The watchdog process uses the same file with
-//! the `wd` tag in its lines.
+//! If there is no usable data folder (or the file cannot be opened), lines go to the debugger output
+//! (`OutputDebugStringW`, visible with DebugView) besides stdout. The watchdog process uses the same
+//! file with the `wd` tag in its lines.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -71,10 +73,10 @@ fn now_ms() -> u64 {
     unsafe { GetTickCount64() }
 }
 
-/// Path of the log file (`%LOCALAPPDATA%\Dock\dock.log`); `None` if the data folder
-/// cannot be created.
+/// Path of the log file (`<data root>\dock.log`); `None` if the data folder is not usable or not
+/// initialized (`datadir::init`). Never initializes anything (safe from the panic hook).
 pub fn log_path() -> Option<PathBuf> {
-    crate::config::ensure_data_dir().map(|d| d.join("dock.log"))
+    crate::datadir::log_path()
 }
 
 /// Formats and sends the line: `Sender::send` on an unbounded channel never blocks the caller.
@@ -107,25 +109,29 @@ macro_rules! log {
 /// Writes a line to the log file (append) IMMEDIATELY and synchronously, bypassing the channel.
 /// Only for the panic hook (with `panic = "abort"` the `log` thread would not have time to drain).
 pub fn write_sync(line: &str) {
-    let Some(path) = log_path() else { return };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{line}");
+    match log_path().and_then(|p| crate::datadir::open_append(&p)) {
+        Some(mut f) => {
+            let _ = writeln!(f, "{line}");
+        }
+        None => crate::datadir::debug_out(line),
     }
 }
 
 fn open_log_file() -> Option<(std::fs::File, u64)> {
     let path = log_path()?;
-    if let Ok(md) = std::fs::metadata(&path) {
-        if md.len() >= MAX_LOG_BYTES {
-            rotate(&path);
-        }
+    let mut f = crate::datadir::open_append(&path)?;
+    let mut len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len >= MAX_LOG_BYTES {
+        drop(f);
+        rotate(&path);
+        f = crate::datadir::open_append(&path)?;
+        len = f.metadata().map(|m| m.len()).unwrap_or(0);
     }
-    let f = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     Some((f, len))
 }
 
-/// Renames `dock.log` to `dock.log.1` (the old `.1` is replaced).
+/// Renames `dock.log` to `dock.log.1` (the old `.1` is replaced). Delete and rename act on the names
+/// themselves (never on a link target), inside the admin-only data folder.
 fn rotate(path: &std::path::Path) {
     let mut old = path.as_os_str().to_owned();
     old.push(".1");
@@ -164,6 +170,8 @@ pub fn start(tag: &'static str) -> Option<JoinHandle<()>> {
                         *len += line.len() as u64 + 2;
                         rotate_now = *len >= MAX_LOG_BYTES;
                     }
+                } else {
+                    crate::datadir::debug_out(&line);
                 }
                 if rotate_now {
                     drop(file.take()); // closes the file before renaming it

@@ -16,7 +16,10 @@
 //!    `taskbar::init` while waiting for `Shell_TrayWnd`: it resets the count but does NOT move the
 //!    watchdog from the startup tolerance (30) to the steady-state one (6), which starts at the first
 //!    real heartbeat from `TIMER_SECOND`.
-//!  * Single instance: named mutex `Local\DockInstance`, taken by `main` before anything else.
+//!  * Single instance: named mutex `Local\DockInstance`, taken by `main` right after parsing the
+//!    arguments, before the data folder (`datadir::init`), the logger and anything else. The watchdog,
+//!    `--restore` and `--install` never take it; `--restore` polls it (`instance_running`) to wait
+//!    for a running dock to exit.
 //!  * Stop event: fixed name `Local\DockStop`, created by the dock at startup (manual-reset); a
 //!    `stop-watch` thread waits on it and, if it fires, posts `WM_DOCK_QUIT_REQUEST` to the window.
 //!    `--restore` signals it with `signal_stop_to_instance()`.
@@ -35,11 +38,11 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenEventW, OpenProcess,
-    ProcessMemoryPriority, ResetEvent, SetEvent, SetProcessInformation, TerminateProcess, WaitForMultipleObjects,
-    WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, EVENT_MODIFY_STATE, INFINITE,
-    MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_VERY_LOW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
+    CreateEventW, CreateMutexW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenEventW, OpenMutexW,
+    OpenProcess, ProcessMemoryPriority, ResetEvent, SetEvent, SetProcessInformation, TerminateProcess,
+    WaitForMultipleObjects, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, EVENT_MODIFY_STATE,
+    INFINITE, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_VERY_LOW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW, SYNCHRONIZATION_SYNCHRONIZE,
 };
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
@@ -90,7 +93,10 @@ pub fn acquire_single_instance() -> bool {
         // SAFETY: GetLastError right after CreateMutexW on the same thread.
         Ok(_h) => (unsafe { GetLastError() }) != ERROR_ALREADY_EXISTS,
         Err(e) => {
-            log!("watchdog: CreateMutexW(instance) failed: {e} (single-instance check skipped)");
+            // Called before the logger starts: the debugger output is the only sink.
+            crate::datadir::debug_out(&format!(
+                "watchdog: CreateMutexW(instance) failed: {e} (single-instance check skipped)"
+            ));
             true
         }
     }
@@ -305,6 +311,21 @@ pub fn shutdown(stop_watcher: Option<JoinHandle<()>>) {
 
 // ------------------------------------------------------ `--restore` side
 
+/// true while a dock instance holds the single-instance mutex (it exists as long as the dock
+/// process lives: the kernel closes it on exit). Works for older dock versions too, unlike the
+/// state file, which moved.
+pub fn instance_running() -> bool {
+    // SAFETY: valid HSTRING name; only SYNCHRONIZE is requested and the handle is closed below.
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(INSTANCE_MUTEX_NAME)) } {
+        Ok(h) => {
+            // SAFETY: handle just opened, closed once.
+            let _ = unsafe { CloseHandle(h) };
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Opens `STOP_EVENT_NAME` and signals it. Returns true if an instance was running (event
 /// existing), false otherwise.
 pub fn signal_stop_to_instance() -> bool {
@@ -401,7 +422,7 @@ pub fn run_watchdog(dock_pid: u32, event_name: &str) -> i32 {
                 log!("watchdog: the dock exited normally");
                 // Exit with Explorer absent: restore_force kept the state file, so the
                 // taskbar is still in autohide. Wait for Explorer and restore.
-                if crate::taskbar::state_file_path().exists() {
+                if crate::taskbar::state_file_exists() {
                     log!("watchdog: state file still present after exit, restoring the taskbar");
                     restore();
                 }

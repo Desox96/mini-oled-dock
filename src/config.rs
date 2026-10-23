@@ -1,14 +1,14 @@
-//! Configuration `%LOCALAPPDATA%\Dock\config.json` and data folder.
+//! Configuration `%ProgramData%\mini-oled-dock\config.json` (folder and file security: `datadir`).
 //!
 //! The config is global and shared across threads: `get()` returns an immutable snapshot
 //! (`Arc<Config>`) that anyone (UI, shell thread) can hold without locking. Changes go
-//! through `modify()` (read-modify-write with an atomic write: temp file + rename) and through
+//! through `modify()` (read-modify-write with an atomic write: temp file + rename, `datadir::write_atomic`) and through
 //! `poll_changed()` (re-read if the mtime changes, called by the UI thread every 2 s).
 //!
 //! Command-line options override the config ONLY through the `effective_*` functions.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -43,7 +43,7 @@ pub struct PinnedApp {
     pub name: String,
     /// Launch target: exe path or `shell:AppsFolder\<AUMID>`.
     pub launch: String,
-    /// Optional custom icon: file name relative to `%LOCALAPPDATA%\Dock\icons\`.
+    /// Optional custom icon: plain file name inside `%ProgramData%\mini-oled-dock\icons\`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 }
@@ -140,36 +140,6 @@ fn cell() -> &'static Mutex<Arc<Config>> {
     CURRENT.get_or_init(|| Mutex::new(Arc::new(Config::default())))
 }
 
-// ------------------------------------------------------------------ data folder
-
-/// `%LOCALAPPDATA%\Dock` (does not create it). If `LOCALAPPDATA` is missing it uses the temp folder.
-pub fn data_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("Dock")
-}
-
-/// Like `data_dir()` but creates the folder if missing; `None` if that fails.
-pub fn ensure_data_dir() -> Option<PathBuf> {
-    let d = data_dir();
-    std::fs::create_dir_all(&d).ok()?;
-    Some(d)
-}
-
-/// `%LOCALAPPDATA%\Dock\config.json`.
-pub fn config_path() -> PathBuf {
-    data_dir().join("config.json")
-}
-
-/// `%LOCALAPPDATA%\Dock\icons` (users' custom PNGs).
-pub fn icons_dir() -> PathBuf {
-    data_dir().join("icons")
-}
-
-/// `%LOCALAPPDATA%\Dock\cache` (PNG cache of extracted icons).
-pub fn cache_dir() -> PathBuf {
-    data_dir().join("cache")
-}
-
 // -------------------------------------------------------------------- access
 
 /// Current config snapshot (cheap: clones an `Arc`). Available from any thread.
@@ -200,6 +170,13 @@ fn lock_mtime() -> std::sync::MutexGuard<'static, Option<SystemTime>> {
 
 fn file_mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).ok()?.modified().ok()
+}
+
+/// Reads a config file through `datadir` (no reparse point followed, size-capped). The content is
+/// untrusted anyway (the user may edit it), so extra hard links do not matter for a read.
+fn read_text(p: &Path) -> std::io::Result<String> {
+    let bytes = crate::datadir::read_file(p, crate::datadir::CONFIG_MAX_BYTES, false)?;
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Removes `//` line comments and `/* */` block comments (JSONC), leaving string literals intact
@@ -287,6 +264,8 @@ fn render(c: &Config) -> String {
     format!(
         r#"{TEMPLATE_MARK}
 // Edit and save: changes are picked up within ~2 seconds, no restart needed.
+// The folder is admin-only: edit this file with Notepad (it saves in place) or an elevated editor.
+// Editors that save by writing a new file and renaming it over this one cannot write here.
 // Comments (// and /* */) are allowed. If the file has a syntax error the previous
 // settings are kept; if the dock must save a change (pin, tray icon) before you fix it,
 // your file is first copied to config.json.bak so no edit is lost.
@@ -347,7 +326,7 @@ fn render(c: &Config) -> String {
   //   "key"    grouping key: the AUMID, or the lowercase exe path
   //   "name"   label shown in the dock
   //   "launch" exe path, or "shell:AppsFolder\\<AUMID>" for Store/packaged apps
-  //   "icon"   optional custom icon: plain PNG file name inside %LOCALAPPDATA%\Dock\icons\
+  //   "icon"   optional custom icon: plain PNG file name inside %ProgramData%\mini-oled-dock\icons\
   //            (e.g. "discord.png"; paths, "..", drive letters and UNC paths are rejected)
   // List the AUMIDs of installed apps with:  Get-StartApps   (PowerShell)
   "pinned": {pinned},
@@ -393,8 +372,13 @@ fn render(c: &Config) -> String {
 /// it logs and uses the defaults WITHOUT overwriting the file. Sets the global snapshot and remembers
 /// the mtime for `poll_changed`. Called once at startup from the main thread.
 pub fn init() -> Arc<Config> {
-    let path = config_path();
-    match std::fs::read_to_string(&path) {
+    let Some(path) = crate::datadir::config_path() else {
+        crate::log!("config: no usable data folder: running with the defaults, nothing is saved");
+        set(Config::default());
+        return get();
+    };
+    report_legacy_dir();
+    match read_text(&path) {
         Ok(text) => match parse(&text) {
             Ok(c) => {
                 crate::log!("config: read from {}", path.display());
@@ -414,11 +398,12 @@ pub fn init() -> Arc<Config> {
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            crate::log!("config: missing, creating {} with defaults", path.display());
-            if let Err(e) = save(&Config::default()) {
+            let c = migrate_legacy().unwrap_or_default();
+            crate::log!("config: missing, creating {}", path.display());
+            if let Err(e) = save(&c) {
                 crate::log!("config: creation failed: {e}");
             }
-            set(Config::default());
+            set(c);
         }
         Err(e) => {
             crate::log!("config: reading {} failed ({e}): using defaults", path.display());
@@ -429,6 +414,55 @@ pub fn init() -> Arc<Config> {
     get()
 }
 
+/// One-time migration: reads the legacy `%LOCALAPPDATA%\Dock\config.json` (safely, see
+/// `datadir::read_legacy_config`) and returns it parsed; the caller writes it through the safe path.
+/// Nothing under the legacy folder is ever written, renamed or deleted.
+fn migrate_legacy() -> Option<Config> {
+    // First choice: the config of a loosely secured data folder moved aside this run (`datadir`).
+    match crate::datadir::read_previous_config() {
+        Ok(None) => {}
+        Ok(Some(bytes)) => match String::from_utf8(bytes).map_err(|e| e.to_string()).and_then(|t| parse(&t)) {
+            Ok(c) => {
+                crate::log!("config: settings recovered from the data folder moved aside");
+                return Some(c);
+            }
+            Err(e) => crate::log!("config: config.json of the moved data folder not recovered ({e})"),
+        },
+        Err(e) => crate::log!("config: config.json of the moved data folder not recovered: {e}"),
+    }
+    match crate::datadir::read_legacy_config() {
+        Ok(None) => None,
+        Ok(Some(bytes)) => match String::from_utf8(bytes).map_err(|e| e.to_string()).and_then(|t| parse(&t)) {
+            Ok(c) => {
+                crate::log!("config: settings migrated from the legacy %LOCALAPPDATA%\\Dock\\config.json");
+                Some(c)
+            }
+            Err(e) => {
+                crate::log!("config: legacy %LOCALAPPDATA%\\Dock\\config.json not migrated ({e}): using the defaults");
+                None
+            }
+        },
+        Err(e) => {
+            crate::log!("config: legacy config not migrated: {e}");
+            None
+        }
+    }
+}
+
+/// Logs that the legacy folder is no longer used (custom icons must be moved by hand). Never touches it.
+fn report_legacy_dir() {
+    let Some(old) = crate::datadir::legacy_dir() else { return };
+    // symlink_metadata does not follow a reparse point: this only reports.
+    if std::fs::symlink_metadata(&old).is_ok() {
+        let icons = crate::datadir::icons_dir().map(|p| p.display().to_string()).unwrap_or_default();
+        crate::log!(
+            "config: the old data folder {} is no longer used. Move your custom icons from its icons \
+             subfolder to {icons}, then delete the old folder (no admin rights needed).",
+            old.display()
+        );
+    }
+}
+
 /// Checks the mtime of `config.json`; if it changed, re-reads, updates the global snapshot and
 /// returns `true` (the UI must rebuild its entries). Does not block: one stat + read of a
 /// small file. Called by the UI thread every 2 s (`TIMER_HOUSEKEEPING`).
@@ -437,7 +471,7 @@ pub fn init() -> Arc<Config> {
 /// snapshot is kept, a message is logged once and `false` is returned; the file is re-read on the next
 /// change. Returns `true` only if the parsed content differs from the snapshot.
 pub fn poll_changed() -> bool {
-    let path = config_path();
+    let Some(path) = crate::datadir::config_path() else { return false };
     let now = file_mtime(&path);
     {
         let mut last = lock_mtime();
@@ -451,7 +485,7 @@ pub fn poll_changed() -> bool {
         crate::log!("config: file removed, keeping the current configuration");
         return false;
     }
-    let text = match std::fs::read_to_string(&path) {
+    let text = match read_text(&path) {
         Ok(t) => t,
         Err(e) => {
             crate::log!("config: re-read failed ({e})");
@@ -499,7 +533,7 @@ pub fn save(c: &Config) -> Result<(), String> {
 /// If `config.json` exists but does not parse (the user is mid-edit or made a typo), copies it to
 /// `config.json.bak` so the rewrite that follows does not destroy those edits.
 fn backup_if_broken(path: &Path) -> Result<(), String> {
-    let text = match std::fs::read_to_string(path) {
+    let text = match read_text(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
@@ -508,25 +542,24 @@ fn backup_if_broken(path: &Path) -> Result<(), String> {
         return Ok(());
     }
     let bak = path.with_extension("json.bak");
-    std::fs::write(&bak, text.as_bytes()).map_err(|e| format!("backup to {}: {e}", bak.display()))?;
+    crate::datadir::write_atomic(&bak, text.as_bytes(), crate::datadir::FileAcl::Inherit)
+        .map_err(|e| format!("backup to {}: {e}", bak.display()))?;
     crate::log!("config: {} has errors, copied to {} before rewriting", path.display(), bak.display());
     Ok(())
 }
 
 /// Atomic write + update of the remembered mtime. Call with `WRITE_LOCK` held.
+/// The new file gets the user-editable DACL (`datadir::FileAcl::UserEditable`) before it replaces
+/// the old one, so hand-editing keeps working after every programmatic save.
 fn write_file(c: &Config) -> Result<(), String> {
-    let dir = ensure_data_dir().ok_or_else(|| "data folder could not be created".to_string())?;
+    if !crate::datadir::writable() {
+        return Err("no writable data folder".into());
+    }
+    let path = crate::datadir::config_path().ok_or_else(|| "no data folder".to_string())?;
     let json = render(c);
-    let path = config_path();
     // Never lose unparsed user edits: refuse to write if they cannot be saved aside.
     backup_if_broken(&path)?;
-    let tmp = dir.join("config.json.tmp");
-    std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-    // std::fs::rename on Windows replaces the destination (MOVEFILE_REPLACE_EXISTING).
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("rename in {}: {e}", path.display()));
-    }
+    crate::datadir::write_atomic(&path, json.as_bytes(), crate::datadir::FileAcl::UserEditable)?;
     *lock_mtime() = file_mtime(&path);
     Ok(())
 }

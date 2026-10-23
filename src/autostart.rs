@@ -70,8 +70,8 @@ pub fn installed_exe() -> Result<PathBuf, String> {
 }
 
 /// Legacy install location `%LOCALAPPDATA%\Dock\bin\dock.exe` (medium-writable: migrated away).
-fn legacy_exe() -> PathBuf {
-    crate::config::data_dir().join("bin").join("dock.exe")
+fn legacy_exe() -> Option<PathBuf> {
+    crate::datadir::legacy_dir().map(|d| d.join("bin").join("dock.exe"))
 }
 
 /// true if `path` lies strictly inside `dir` (case-insensitive, separator-aware string check on
@@ -282,7 +282,7 @@ pub fn enable(allow_stop: bool) -> Result<bool, String> {
 /// here: this process is elevated and the folder is medium-writable, so a planted junction or symlink
 /// could turn the delete into an arbitrary-file delete. Deleting it as the normal user is safe.
 fn report_legacy_copy() {
-    let old = legacy_exe();
+    let Some(old) = legacy_exe() else { return };
     // symlink_metadata does not follow reparse points: this only reports, nothing is opened or changed.
     if std::fs::symlink_metadata(&old).is_ok() {
         log!("autostart: legacy copy {} still present (not deleted by the elevated installer)", old.display());

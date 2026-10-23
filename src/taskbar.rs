@@ -8,8 +8,9 @@
 //!  * `restore()` and `restore_force()`: callable from ANY thread/process (panic hook,
 //!    WM_ENDSESSION, watchdog, CLI `--restore`; Ctrl+C instead posts WM_CLOSE to the UI). They use only
 //!    thread-safe Win32 APIs and do not touch thread-local state.
-//!  * On-disk state: `%LOCALAPPDATA%\Dock\taskbar-state` (text: the numeric `ABS_*` value),
-//!    atomic write (tmp + rename).
+//!  * On-disk state: `%ProgramData%\mini-oled-dock\taskbar-state` (text: the numeric `ABS_*` value),
+//!    admin-only folder, atomic write (`datadir::write_atomic`), read without following reparse
+//!    points. Without a usable data folder the state cannot be saved and the taskbar is never hidden.
 //!  * The dock does NOT register an AppBar and does NOT reserve a work area.
 
 use std::ffi::c_void;
@@ -66,9 +67,14 @@ const OWN_BROADCAST_WINDOW_MS: u64 = 2000;
 /// Maximum wait for `Shell_TrayWnd` at startup.
 const WAIT_TRAY_MS: u64 = 30_000;
 
-/// `%LOCALAPPDATA%\Dock\taskbar-state`.
-pub fn state_file_path() -> PathBuf {
-    crate::config::data_dir().join("taskbar-state")
+/// `<data root>\taskbar-state` (`None` without a usable data folder).
+pub fn state_file_path() -> Option<PathBuf> {
+    crate::datadir::state_path()
+}
+
+/// true if the state file exists (the name itself: a link is not followed).
+pub fn state_file_exists() -> bool {
+    state_file_path().is_some_and(|p| std::fs::symlink_metadata(p).is_ok())
 }
 
 /// Id of the `TaskbarCreated` message (`RegisterWindowMessageW`, registered by `init`).
@@ -259,24 +265,62 @@ fn set_state(tray: HWND, state: u32) -> bool {
 
 // ------------------------------------------------------------ state file
 
-/// Reads the saved state; `None` if the file is missing or unreadable/invalid.
-fn read_state() -> Option<u32> {
-    let txt = std::fs::read_to_string(state_file_path()).ok()?;
-    let v = txt.trim().parse::<u32>().ok()?;
+/// Parses a state file's content (decimal `ABS_*` value), masked to `ABS_MASK`. Pure.
+fn parse_state(bytes: &[u8]) -> Option<u32> {
+    let v = std::str::from_utf8(bytes).ok()?.trim().parse::<u32>().ok()?;
     Some(v & ABS_MASK)
 }
 
-/// Atomic write (temporary file + rename).
-fn write_state(state: u32) -> Result<(), String> {
-    let dir = config::ensure_data_dir().ok_or("data folder could not be created")?;
-    let tmp = dir.join("taskbar-state.tmp");
-    let dst = state_file_path();
-    std::fs::write(&tmp, state.to_string()).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    if let Err(e) = std::fs::rename(&tmp, &dst) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("rename {}: {e}", dst.display()));
+/// Reads the saved state; `None` if the file is missing or unreadable/invalid.
+fn read_state() -> Option<u32> {
+    parse_state(&crate::datadir::read_file(&state_file_path()?, crate::datadir::STATE_MAX_BYTES, true).ok()?)
+}
+
+// ------------------------------------------------- legacy state (pre-ProgramData versions)
+
+/// State file of the previous dock versions, `%LOCALAPPDATA%\Dock\taskbar-state`. If such a dock
+/// exited uncleanly, Explorer keeps OUR autohide and only this file knows the original state.
+/// It is only ever READ (medium-writable folder): never written or deleted by this process.
+fn legacy_state_path() -> Option<PathBuf> {
+    crate::datadir::legacy_dir().map(|d| d.join("taskbar-state"))
+}
+
+/// Marker in the admin-only data folder: the legacy state has been taken over (saved as our own
+/// state or restored), so the stale legacy file is ignored from then on.
+fn legacy_marker_path() -> Option<PathBuf> {
+    state_file_path().map(|p| p.with_extension("legacy-done"))
+}
+
+/// The legacy state if it exists and has not been taken over yet. Without a writable data folder the
+/// take-over could not be recorded, so it is ignored (it would otherwise override the user's
+/// setting on every restore). Read without following reparse points, single link, size-capped;
+/// the value is masked, and a medium process could set the same taskbar state itself anyway.
+fn read_legacy_state() -> Option<u32> {
+    if !crate::datadir::writable() || legacy_marker_path().is_none_or(|m| std::fs::symlink_metadata(m).is_ok()) {
+        return None;
     }
-    Ok(())
+    let bytes = crate::datadir::read_file(&legacy_state_path()?, crate::datadir::STATE_MAX_BYTES, true).ok()?;
+    parse_state(&bytes)
+}
+
+/// Records that the legacy state has been taken over (the legacy file itself is left alone).
+fn mark_legacy_consumed() {
+    let Some(m) = legacy_marker_path() else { return };
+    match crate::datadir::write_atomic(&m, b"1", crate::datadir::FileAcl::Inherit) {
+        Ok(()) => log!(
+            "taskbar: legacy state taken over; %LOCALAPPDATA%\\Dock\\taskbar-state is no longer used (delete it yourself)"
+        ),
+        Err(e) => log!("taskbar: recording the legacy state take-over failed: {e}"),
+    }
+}
+
+/// Atomic write (temporary file + rename) in the admin-only data folder.
+fn write_state(state: u32) -> Result<(), String> {
+    if !crate::datadir::writable() {
+        return Err("no writable data folder".into());
+    }
+    let dst = state_file_path().ok_or("no data folder")?;
+    crate::datadir::write_atomic(&dst, state.to_string().as_bytes(), crate::datadir::FileAcl::Inherit)
 }
 
 /// saves the original state ONLY if the file is missing or unreadable.
@@ -291,7 +335,16 @@ fn ensure_state_saved(pre: Option<u32>) -> bool {
         log!("taskbar: no Shell_TrayWnd, state cannot be saved");
         return false;
     };
-    let mut state = pre.unwrap_or_else(|| get_state(tray));
+    // A previous dock version that died with the taskbar hidden left the true original state in the
+    // legacy file: Explorer's current state is then OUR autohide and must not become the "original".
+    let legacy = read_legacy_state();
+    let mut state = match legacy {
+        Some(s) => {
+            log!("taskbar: using the original state saved by the previous dock version ({s})");
+            s
+        }
+        None => pre.unwrap_or_else(|| get_state(tray)),
+    };
     // Heuristic: autohide active + our mark = the autohide is the work of a previous dead run.
     if state & ABS_AUTOHIDE != 0 && list.iter().any(|&h| has_dock_prop(h)) {
         state = ABS_ALWAYSONTOP;
@@ -299,6 +352,9 @@ fn ensure_state_saved(pre: Option<u32>) -> bool {
     match write_state(state) {
         Ok(()) => {
             log!("taskbar: original state saved ({state})");
+            if legacy.is_some() {
+                mark_legacy_consumed();
+            }
             true
         }
         Err(e) => {
@@ -374,7 +430,7 @@ pub fn init() -> Result<bool, String> {
     self_heal();
     // At logon Explorer may not have loaded the settings yet: ABM_GETSTATE read too
     // early would give a wrong state. Needed only if there is no saved state yet.
-    let pre = if read_state().is_none() { stable_state(&mut last_beat) } else { None };
+    let pre = if read_state().is_none() && read_legacy_state().is_none() { stable_state(&mut last_beat) } else { None };
     if !ensure_state_saved(pre) {
         log!("taskbar: original state not saveable, NOT hiding the taskbar");
         return Ok(false);
@@ -438,7 +494,7 @@ fn restored_externally() -> bool {
     if !HIDDEN.load(Relaxed) {
         return false;
     }
-    if state_file_path().exists() {
+    if state_file_exists() {
         return false;
     }
     HIDDEN.store(false, Relaxed);
@@ -612,7 +668,7 @@ pub fn on_taskbar_created() {
 pub fn restore() {
     RESTORING.store(true, Relaxed);
     let was_hidden = HIDDEN.swap(false, Relaxed);
-    if !was_hidden && !state_file_path().exists() {
+    if !was_hidden && !state_file_exists() && read_legacy_state().is_none() {
         return;
     }
     restore_force();
@@ -628,15 +684,17 @@ pub fn restore_force() {
     RESTORING.store(true, Relaxed);
     HIDDEN.store(false, Relaxed);
     let saved = read_state();
+    // No state of ours: a previous dock version may have died leaving its (legacy) state behind.
+    let legacy = if saved.is_none() { read_legacy_state() } else { None };
     let list = native_taskbars();
     // Guard: without a state file and without our mark there is nothing to restore (avoids
     // forcing ALWAYSONTOP over the user's autohide setting when the watchdog fires after
     // an exit that was already restored). Does not depend on visibility: the dock's asynchronous SW_SHOWNA
     // may not have been executed by Explorer yet. `hide_all` always marks BEFORE hiding.
-    if saved.is_none() && !list.iter().any(|&h| has_dock_prop(h)) {
+    if saved.is_none() && legacy.is_none() && !list.iter().any(|&h| has_dock_prop(h)) {
         return;
     }
-    let state = saved.unwrap_or(ABS_ALWAYSONTOP);
+    let state = saved.or(legacy).unwrap_or(ABS_ALWAYSONTOP);
     let Some(&first) = list.first() else {
         // Explorer absent or restarting: ABM_SETSTATE impossible. The file stays, so the next
         // run (or another `--restore`) restores the right original state instead of saving as
@@ -666,11 +724,17 @@ pub fn restore_force() {
     // did not reach Explorer (session shutting down, hung) the file stays: the autohide set by
     // us has already been persisted by Explorer and without a file the next run would save it as "original".
     // This way the watchdog, the next run's self-heal or `--restore` complete the restore.
+    if delivered && legacy.is_some() {
+        mark_legacy_consumed();
+    }
     if !delivered {
         log!("taskbar: ABM_SETSTATE not delivered, state file kept");
-    } else if let Err(e) = std::fs::remove_file(state_file_path()) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            log!("taskbar: removing state file failed: {e}");
+    } else if let Some(p) = state_file_path() {
+        // Deletes the name itself (never a link target), inside the admin-only data folder.
+        if let Err(e) = std::fs::remove_file(p) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log!("taskbar: removing state file failed: {e}");
+            }
         }
     }
     let msg = ensure_taskbar_created_msg();
@@ -748,10 +812,15 @@ pub fn run_restore_cli() -> i32 {
     let running = crate::watchdog::signal_stop_to_instance();
     if running {
         log!("--restore: instance running, exit request sent");
-        // On exit the instance restores and deletes the state file: that is the signal it has finished.
+        // Wait for the instance to really exit: its single-instance mutex disappears with the process.
+        // (Not the state file: an older dock keeps it in the legacy folder.) Then restore over a quiet
+        // taskbar, so the exiting dock cannot re-hide it on our TaskbarCreated broadcast.
         let t = Instant::now();
-        while t.elapsed() < Duration::from_secs(3) && state_file_path().exists() {
+        while t.elapsed() < Duration::from_secs(5) && crate::watchdog::instance_running() {
             std::thread::sleep(Duration::from_millis(100));
+        }
+        if crate::watchdog::instance_running() {
+            log!("--restore: the instance did not exit within 5 s, restoring anyway");
         }
         // A moment to let the process shutdown finish.
         std::thread::sleep(Duration::from_millis(200));
@@ -760,4 +829,27 @@ pub fn run_restore_cli() -> i32 {
     }
     restore_force_waiting(Duration::from_secs(5));
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_parsing_masks_and_rejects() {
+        assert_eq!(parse_state(b"2"), Some(ABS_ALWAYSONTOP));
+        assert_eq!(parse_state(b" 3\r\n"), Some(ABS_AUTOHIDE | ABS_ALWAYSONTOP));
+        // Unknown bits from a (medium-writable) legacy file are masked away.
+        assert_eq!(parse_state(b"4294967295"), Some(ABS_MASK));
+        assert_eq!(parse_state(b"autohide"), None);
+        assert_eq!(parse_state(b""), None);
+        assert_eq!(parse_state(&[0xFF, 0xFE]), None);
+    }
+
+    #[test]
+    fn legacy_state_ignored_without_data_folder() {
+        // Unit tests never initialize the data folder: nothing legacy is read or recorded.
+        assert_eq!(read_legacy_state(), None);
+        assert!(legacy_marker_path().is_none());
+    }
 }

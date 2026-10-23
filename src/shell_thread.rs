@@ -81,7 +81,7 @@ pub struct ResolveApp {
     pub hwnd: isize,
     /// Final icon side in physical pixels (24 logical * dpi/96).
     pub icon_px: u32,
-    /// `icon` field of the pin in the config (relative to `icons_dir()`), if present.
+    /// `icon` field of the pin in the config (plain name inside `datadir::icons_dir()`), if present.
     pub custom_icon: Option<String>,
 }
 
@@ -918,11 +918,8 @@ fn resolve_icon(r: &ResolveApp) -> Option<IconBitmap> {
     let px = if r.icon_px == 0 { 24 } else { r.icon_px.clamp(8, 256) };
 
     // 1. User's custom PNG (absolute priority, never cached).
-    if let Some(p) = icons::custom_icon_path(&r.key, r.custom_icon.as_deref()) {
-        if let Some(b) = icons::load_png(&p).and_then(nonempty) {
-            return nonempty(icons::resize_area(&b, px));
-        }
-        log!("shell: custom icon '{}' not readable, using the extracted one", p.display());
+    if let Some(b) = icons::load_custom_icon(&r.key, r.custom_icon.as_deref()).and_then(nonempty) {
+        return nonempty(icons::resize_area(&b, px));
     }
 
     // 2. Disk cache (64 px master), invalidated by the exe's mtime.
@@ -1067,7 +1064,7 @@ fn icon_from_window(hwnd: isize) -> Option<IconBitmap> {
 // ------------------------------------------------------------------ launch
 
 /// true if the current process is elevated (token with `TokenIsElevated`). Computed once.
-fn is_elevated() -> bool {
+pub(crate) fn is_elevated() -> bool {
     static ELEVATED: OnceLock<bool> = OnceLock::new();
     *ELEVATED.get_or_init(|| {
         let mut token = HANDLE::default();

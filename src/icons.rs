@@ -3,13 +3,20 @@
 //!
 //! THREADING: ALL functions in this module that touch GDI/COM/WIC must be called from the
 //! shell thread (COM STA already initialized). `IconBitmap`, `sanitize_key`, `resize_area`,
-//! `cache_path`, `custom_icon_path` are pure/thread-safe and usable anywhere.
+//! `cache_path`, `is_plain_icon_name` are pure/thread-safe and usable anywhere.
 //!
 //! FORMAT: `IconBitmap::pixels` is a row-major, top-down `Vec<u32>`, each pixel 0xAARRGGBB
 //! PREMULTIPLIED (the same layout as the 32-bit DIB of `render`, so blending is a direct
 //! read). On disk the PNGs are NOT premultiplied (converted on read/write).
 //!
-//! DISK CACHE: `%LOCALAPPDATA%\Dock\cache\<sanitized-key>.png`, always
+//! FILE I/O: every file is read into memory through `datadir` (no reparse point followed, size cap)
+//! and decoded from memory; PNGs are encoded into memory and written with `datadir::write_atomic`.
+//! WIC never opens a path itself.
+//!
+//! CUSTOM ICONS: `%ProgramData%\mini-oled-dock\icons\<name>`; the user can create files there, so
+//! `datadir::read_icon` checks the handle (regular file, one link, final path inside the folder).
+//!
+//! DISK CACHE: `%ProgramData%\mini-oled-dock\cache\<sanitized-key>.png` (admin-only), always
 //! `MASTER_PX` x `MASTER_PX` (64). The UI then asks for the final size
 //! (24 logical * dpi/96) and `resize_area` does the downscale. Invalidated if the exe mtime is
 //! newer than the cached PNG; if the exe mtime is unknown (UWP apps) the cache
@@ -21,19 +28,22 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use windows::core::{Interface, HSTRING};
-use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, SIZE};
+use windows::Win32::Foundation::{HGLOBAL, SIZE};
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     DIB_RGB_COLORS, HBITMAP, HGDIOBJ,
 };
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppBGRA, GUID_WICPixelFormat32bppPBGRA,
-    IWICBitmapDecoder, IWICBitmapFrameEncode, IWICBitmapScaler, IWICBitmapSource, IWICImagingFactory, IWICStream,
-    WICBitmapDitherTypeNone, WICBitmapEncoderNoCache, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom,
-    WICDecodeMetadataCacheOnDemand,
+    CLSID_WICImagingFactory, GUID_ContainerFormatPng, GUID_VendorMicrosoftBuiltIn, GUID_WICPixelFormat32bppBGRA,
+    GUID_WICPixelFormat32bppPBGRA, IWICBitmapDecoder, IWICBitmapFrameEncode, IWICBitmapScaler, IWICBitmapSource,
+    IWICImagingFactory, IWICStream, WICBitmapDitherTypeNone, WICBitmapEncoderNoCache, WICBitmapInterpolationModeFant,
+    WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
+use windows::Win32::System::Com::StructuredStorage::CreateStreamOnHGlobal;
 use windows::Win32::System::Com::StructuredStorage::IPropertyBag2;
-use windows::Win32::System::Com::{CoCreateInstance, IBindCtx, CLSCTX_INPROC_SERVER, STGC_DEFAULT};
+use windows::Win32::System::Com::{
+    CoCreateInstance, IBindCtx, IStream, CLSCTX_INPROC_SERVER, STREAM_SEEK_CUR, STREAM_SEEK_SET,
+};
 use windows::Win32::UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY};
 use windows::Win32::UI::WindowsAndMessaging::{GetIconInfoExW, HICON, ICONINFOEXW};
 
@@ -93,46 +103,51 @@ pub fn sanitize_key(key: &str) -> String {
     }
 }
 
-/// Path of the cache PNG for `key` (`cache_dir()/<sanitize_key(key)>.png`).
-pub fn cache_path(key: &str) -> PathBuf {
-    crate::config::cache_dir().join(format!("{}.png", sanitize_key(key)))
+/// Path of the cache PNG for `key` (`<cache>/<sanitize_key(key)>.png`); `None` without a cache folder.
+pub fn cache_path(key: &str) -> Option<PathBuf> {
+    crate::datadir::cache_dir().map(|d| d.join(format!("{}.png", sanitize_key(key))))
 }
 
-/// Path of the user's custom icon for `key`: if `configured` (the pin's `icon` field) is a valid
-/// plain file name (`is_plain_icon_name`), `icons_dir()/<configured>`; otherwise
-/// `icons_dir()/<sanitize_key(key)>.png`. Returns `Some` only if the file exists and, once
-/// resolved (symlinks included), its parent is `icons_dir()` itself.
-/// If `configured` is rejected or missing, the by-key name is still tried.
+/// The user's custom icon for `key`, decoded: if `configured` (the pin's `icon` field) is a valid
+/// plain file name (`is_plain_icon_name`), `icons\<configured>`; otherwise (or if that is missing)
+/// `icons\<sanitize_key(key)>.png`. Shell thread (WIC).
 ///
-/// SECURITY: the config is writable by any medium-integrity process while the dock runs
-/// elevated, so `configured` is untrusted: absolute, UNC, `..` or ADS paths are rejected
-/// (they would make the elevated process read arbitrary files or authenticate to remote hosts).
-pub fn custom_icon_path(key: &str, configured: Option<&str>) -> Option<PathBuf> {
-    let dir = crate::config::icons_dir();
+/// SECURITY: the config is untrusted input (the user edits it; it used to be writable by any
+/// medium process), so `configured` must be a plain name: absolute, UNC, `..` or ADS paths are
+/// rejected. The file itself is read by `datadir::read_icon`, which refuses reparse points, hard
+/// links and anything whose final path is not exactly inside the icons folder, and caps the size;
+/// the bytes are then decoded from memory.
+pub fn load_custom_icon(key: &str, configured: Option<&str>) -> Option<IconBitmap> {
     if let Some(c) = configured.map(str::trim).filter(|s| !s.is_empty()) {
         if !is_plain_icon_name(c) {
             crate::log!("icons: custom icon '{c}' rejected: only a plain file name inside the icons folder is allowed");
-        } else if let Some(full) = resolve_inside(&dir, c) {
-            return Some(full);
+        } else if let Some(b) = read_custom(c) {
+            return Some(b);
         }
     }
-    resolve_inside(&dir, &format!("{}.png", sanitize_key(key)))
+    let by_key = format!("{}.png", sanitize_key(key));
+    if is_plain_icon_name(&by_key) {
+        read_custom(&by_key)
+    } else {
+        None
+    }
 }
 
-/// `dir/<name>` if it is an existing file whose canonical parent is the canonical `dir`
-/// (defeats symlinks / reparse points that lead outside the icons folder).
-fn resolve_inside(dir: &Path, name: &str) -> Option<PathBuf> {
-    let full = dir.join(name);
-    if !full.is_file() {
-        return None;
-    }
-    let canon_dir = std::fs::canonicalize(dir).ok()?;
-    let canon = std::fs::canonicalize(&full).ok()?;
-    if canon.parent() == Some(canon_dir.as_path()) {
-        Some(full)
-    } else {
-        crate::log!("icons: custom icon '{}' resolves outside the icons folder, rejected", full.display());
-        None
+/// Reads and decodes `icons\<name>`; a missing file is silent, anything else is logged.
+fn read_custom(name: &str) -> Option<IconBitmap> {
+    match crate::datadir::read_icon(name) {
+        Ok(bytes) => {
+            let b = decode_image_bytes(&bytes);
+            if b.is_none() {
+                log!("icons: custom icon '{name}' could not be decoded, using the extracted one");
+            }
+            b
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            log!("icons: custom icon '{name}' refused: {e}");
+            None
+        }
     }
 }
 
@@ -482,19 +497,6 @@ fn wic_factory() -> Result<IWICImagingFactory, String> {
         .map_err(|e| format!("CoCreateInstance(WICImagingFactory): {e}"))
 }
 
-fn load_png_impl(path: &Path) -> Result<IconBitmap, String> {
-    let factory = wic_factory()?;
-    let wide = HSTRING::from(path.as_os_str());
-    // SAFETY: all COM calls on valid, freshly created interfaces; the buffers passed have the
-    // declared size (stride * height); no pointer outlives the function.
-    unsafe {
-        let decoder = factory
-            .CreateDecoderFromFilename(&wide, None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
-            .map_err(|e| format!("CreateDecoderFromFilename: {e}"))?;
-        decoder_to_bitmap(&factory, &decoder)
-    }
-}
-
 /// First frame of `decoder` -> premultiplied bitmap (downscaled by WIC if > `LOAD_MAX_SIDE`).
 fn decoder_to_bitmap(factory: &IWICImagingFactory, decoder: &IWICBitmapDecoder) -> Result<IconBitmap, String> {
     // SAFETY: COM calls on valid interfaces; the buffers passed have the declared size
@@ -539,29 +541,17 @@ fn decoder_to_bitmap(factory: &IWICImagingFactory, decoder: &IWICBitmapDecoder) 
     }
 }
 
-/// Reads a PNG from disk via WIC (PNG decoder -> `GUID_WICPixelFormat32bppPBGRA`).
-/// Shell thread (WIC requires COM). `None` if missing or invalid. Images with the longer
-/// side > 512 px are downscaled by WIC.
-pub fn load_png(path: &Path) -> Option<IconBitmap> {
-    match load_png_impl(path) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            log!("icons::load_png({}): {e}", path.display());
-            None
-        }
-    }
-}
-
-fn write_png_impl(tmp: &Path, bmp: &IconBitmap) -> Result<(), String> {
+/// Encodes `bmp` as a PNG in memory (WIC PNG encoder, non-premultiplied 32bppBGRA) and returns the
+/// file bytes. Requires COM on the calling thread.
+fn encode_png(bmp: &IconBitmap) -> Result<Vec<u8>, String> {
     let factory = wic_factory()?;
-    let wide = HSTRING::from(tmp.as_os_str());
     let bytes: Vec<u8> = bmp.pixels.iter().flat_map(|&p| unpremultiply_px(p).to_le_bytes()).collect();
     // SAFETY: COM calls on valid interfaces; `bytes` holds width*height*4 bytes as declared
-    // to WritePixels (stride = width*4, lines = height). All objects are released
-    // on function exit, so the file is closed before the caller's rename.
+    // to WritePixels (stride = width*4, lines = height). `out` is writable for the `len` bytes
+    // passed to Read. The HGLOBAL stream owns (and frees) its memory.
     unsafe {
-        let stream = factory.CreateStream().map_err(|e| format!("CreateStream: {e}"))?;
-        stream.InitializeFromFilename(&wide, GENERIC_WRITE.0).map_err(|e| format!("InitializeFromFilename: {e}"))?;
+        let stream: IStream =
+            CreateStreamOnHGlobal(HGLOBAL::default(), true).map_err(|e| format!("CreateStreamOnHGlobal: {e}"))?;
         let encoder = factory
             .CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())
             .map_err(|e| format!("CreateEncoder: {e}"))?;
@@ -579,15 +569,27 @@ fn write_png_impl(tmp: &Path, bmp: &IconBitmap) -> Result<(), String> {
         frame.WritePixels(bmp.height, bmp.width * 4, &bytes).map_err(|e| format!("WritePixels: {e}"))?;
         frame.Commit().map_err(|e| format!("Frame::Commit: {e}"))?;
         encoder.Commit().map_err(|e| format!("Encoder::Commit: {e}"))?;
-        let _ = stream.Commit(STGC_DEFAULT);
+        let mut len = 0u64;
+        stream.Seek(0, STREAM_SEEK_CUR, Some(&mut len)).map_err(|e| format!("Seek: {e}"))?;
+        let len = u32::try_from(len).map_err(|_| "PNG too large".to_string())?;
+        stream.Seek(0, STREAM_SEEK_SET, None).map_err(|e| format!("Seek: {e}"))?;
+        let mut out = vec![0u8; len as usize];
+        let mut read = 0u32;
+        stream.Read(out.as_mut_ptr().cast(), len, Some(&mut read)).ok().map_err(|e| format!("Read: {e}"))?;
+        out.truncate(read as usize);
+        Ok(out)
     }
-    Ok(())
 }
 
-/// Writes `bmp` as a PNG via WIC (PNG encoder, non-premultiplied 32bppBGRA format).
-/// Creates missing folders; writes to a temporary file + rename. Shell thread.
+/// true if `bmp` has a consistent, non-empty pixel buffer.
+fn encodable(bmp: &IconBitmap) -> bool {
+    !bmp.is_empty() && bmp.pixels.len() == (bmp.width as usize) * (bmp.height as usize)
+}
+
+/// Writes `bmp` as a PNG file (encoded in memory, then `datadir::write_atomic`: new temp file +
+/// rename). Creates missing folders. Used by `--preview` (a folder chosen by the user). Shell thread.
 pub fn save_png(path: &Path, bmp: &IconBitmap) -> bool {
-    if bmp.is_empty() || bmp.pixels.len() != (bmp.width as usize) * (bmp.height as usize) {
+    if !encodable(bmp) {
         return false;
     }
     if let Some(dir) = path.parent() {
@@ -596,21 +598,12 @@ pub fn save_png(path: &Path, bmp: &IconBitmap) -> bool {
             return false;
         }
     }
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = PathBuf::from(tmp_name);
-    let res = write_png_impl(&tmp, bmp).and_then(|()| {
-        // `rename` replaces the existing destination file on Windows.
-        std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))
-    });
-    match res {
-        Ok(()) => true,
-        Err(e) => {
-            log!("icons::save_png({}): {e}", path.display());
-            let _ = std::fs::remove_file(&tmp);
-            false
-        }
+    let res =
+        encode_png(bmp).and_then(|bytes| crate::datadir::write_atomic(path, &bytes, crate::datadir::FileAcl::Inherit));
+    if let Err(e) = &res {
+        log!("icons::save_png({}): {e}", path.display());
     }
+    res.is_ok()
 }
 
 // ------------------------------------------------------------------ disk cache
@@ -619,7 +612,7 @@ pub fn save_png(path: &Path, bmp: &IconBitmap) -> bool {
 /// known) is NOT newer than the cached PNG; if unknown, only if the PNG is under 7 days old.
 /// Returns the already-loaded master PNG (`MASTER_PX`). Shell thread.
 pub fn cache_load(key: &str, exe_mtime: Option<SystemTime>) -> Option<IconBitmap> {
-    let path = cache_path(key);
+    let path = cache_path(key)?;
     let png_mtime = file_mtime(&path)?;
     match exe_mtime {
         Some(m) if m > png_mtime => return None,
@@ -630,7 +623,14 @@ pub fn cache_load(key: &str, exe_mtime: Option<SystemTime>) -> Option<IconBitmap
             }
         }
     }
-    let bmp = load_png(&path)?;
+    let bytes = crate::datadir::read_file(&path, crate::datadir::CACHE_MAX_BYTES, true)
+        .map_err(|e| {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log!("icons::cache_load({}): {e}", path.display());
+            }
+        })
+        .ok()?;
+    let bmp = decode_image_bytes(&bytes)?;
     if bmp.width != MASTER_PX || bmp.height != MASTER_PX {
         log!("icons::cache_load: {} is not {MASTER_PX}x{MASTER_PX}, discarded", path.display());
         return None;
@@ -641,8 +641,15 @@ pub fn cache_load(key: &str, exe_mtime: Option<SystemTime>) -> Option<IconBitmap
 /// Saves the master `bmp` (see `MASTER_PX`) in the cache for `key`. Errors are only logged.
 /// Shell thread.
 pub fn cache_store(key: &str, bmp: &IconBitmap) {
-    if !save_png(&cache_path(key), bmp) {
-        log!("icons::cache_store: saving '{key}' failed");
+    if !crate::datadir::writable() || !encodable(bmp) {
+        return;
+    }
+    let Some(path) = cache_path(key) else { return };
+    // The cache folder is admin-only (created and verified by `datadir`): the PNG inherits its DACL.
+    let res =
+        encode_png(bmp).and_then(|bytes| crate::datadir::write_atomic(&path, &bytes, crate::datadir::FileAcl::Inherit));
+    if let Err(e) = res {
+        log!("icons::cache_store: saving '{key}' failed: {e}");
     }
 }
 
@@ -745,6 +752,16 @@ mod tests {
     }
 
     #[test]
+    fn png_signature_only() {
+        assert!(is_png(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0]));
+        assert!(!is_png(&[0xFF, 0xD8, 0xFF, 0xE0, b'j', b'p', b'g']));
+        assert!(!is_png(b"GIF89a"));
+        assert!(!is_png(&[0x89, b'P', b'N']));
+        // A non-PNG never reaches WIC (no COM needed for the refusal).
+        assert!(decode_image_bytes(b"BM not a png").is_none());
+    }
+
+    #[test]
     fn sanitize() {
         assert_eq!(sanitize_key("C:\\Program Files\\x.exe"), "c__program_files_x.exe");
     }
@@ -763,7 +780,8 @@ mod tests {
         }
         let path = std::env::temp_dir().join("dock_icons_test_roundtrip.png");
         assert!(save_png(&path, &s));
-        let back = load_png(&path).expect("load");
+        let bytes = crate::datadir::read_file(&path, crate::datadir::CACHE_MAX_BYTES, true).expect("read");
+        let back = decode_image_bytes(&bytes).expect("decode");
         let _ = std::fs::remove_file(&path);
         assert_eq!((back.width, back.height), (64, 64));
         for (a, b) in s.pixels.iter().zip(back.pixels.iter()) {
@@ -781,9 +799,24 @@ mod tests {
 
 // ------------------------------------------------------------------ notification icons
 
-/// Decodes an in-memory image (PNG/JPEG/...) via WIC -> premultiplied bitmap.
+/// PNG file signature (first 8 bytes).
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// true if `bytes` starts with the PNG signature. Pure.
+pub fn is_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(&PNG_SIGNATURE)
+}
+
+/// Decodes an in-memory PNG via WIC -> premultiplied bitmap. PNG ONLY: the bytes come from the user
+/// (custom icons), the cache or other apps (notification logos), and the dock is elevated, so the
+/// decoder is chosen explicitly (`CreateDecoder(PNG)`, preferring the built-in Microsoft one) instead
+/// of letting WIC probe every installed codec (HEIF, WebP, RAW, third-party). Anything else is refused.
 /// Requires COM initialized on the calling thread (MTA or STA).
 pub fn decode_image_bytes(bytes: &[u8]) -> Option<IconBitmap> {
+    if !is_png(bytes) {
+        log!("icons: in-memory image refused: not a PNG");
+        return None;
+    }
     let r = (|| -> Result<IconBitmap, String> {
         let factory = wic_factory()?;
         // SAFETY: `stream` is initialized on the `bytes` buffer, which lives until the end of the function
@@ -792,8 +825,11 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<IconBitmap> {
             let stream: IWICStream = factory.CreateStream().map_err(|e| format!("CreateStream: {e}"))?;
             stream.InitializeFromMemory(bytes).map_err(|e| format!("InitializeFromMemory: {e}"))?;
             let decoder = factory
-                .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
-                .map_err(|e| format!("CreateDecoderFromStream: {e}"))?;
+                .CreateDecoder(&GUID_ContainerFormatPng, &GUID_VendorMicrosoftBuiltIn)
+                .map_err(|e| format!("CreateDecoder(PNG): {e}"))?;
+            decoder
+                .Initialize(&stream, WICDecodeMetadataCacheOnDemand)
+                .map_err(|e| format!("Decoder::Initialize: {e}"))?;
             decoder_to_bitmap(&factory, &decoder)
         }
     })();
