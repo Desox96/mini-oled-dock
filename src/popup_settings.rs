@@ -1,7 +1,7 @@
 //! SETTINGS popup (from "Settings" in the power popup): the dock's own options on three short pages.
 //!
 //!  * Main page. Appearance: position and display mode (segmented choices drawn by hand), then
-//!    "Background ›" and "Sizes ›" (sub-pages). Behavior: auto-hide, clock seconds (switches).
+//!    "Background ›" and "Sizes ›" (sub-pages). Behavior: auto-hide, window previews, clock seconds (switches).
 //!    Modules: one switch per system module (`config::MODULE_NAMES` mechanism) and, with the tray on,
 //!    "Choose tray icons" (switches to the tray popup in chooser mode).
 //!  * Background page: preset swatches (`config::BACKGROUND_PRESETS`) plus a custom swatch that opens
@@ -81,6 +81,7 @@ enum Setting {
     Position,
     Display,
     AutoHide,
+    Previews,
     Seconds,
     /// `Config::module_visible` name.
     Module(&'static str),
@@ -133,6 +134,7 @@ fn items(c: &Config, page: Page, picker_open: bool) -> Vec<Item> {
                 Item::Open(Page::Sizes, "Sizes"),
                 Item::Section("Behavior"),
                 Item::Toggle(Setting::AutoHide, "Auto-hide"),
+                Item::Toggle(Setting::Previews, "Window previews"),
                 Item::Toggle(Setting::Seconds, "Clock seconds"),
                 Item::Section("Modules"),
             ];
@@ -211,6 +213,7 @@ fn choose(c: &mut Config, s: Setting, j: usize) {
 fn is_on(c: &Config, s: Setting) -> bool {
     match s {
         Setting::AutoHide => c.autohide,
+        Setting::Previews => c.window_previews,
         Setting::Seconds => c.show_seconds,
         Setting::Module(n) => c.module_visible(n),
         _ => false,
@@ -220,6 +223,7 @@ fn is_on(c: &Config, s: Setting) -> bool {
 fn flip(c: &mut Config, s: Setting) {
     match s {
         Setting::AutoHide => c.autohide = !c.autohide,
+        Setting::Previews => c.window_previews = !c.window_previews,
         Setting::Seconds => c.show_seconds = !c.show_seconds,
         Setting::Module(n) => {
             let on = c.module_visible(n);
@@ -919,7 +923,13 @@ mod tests {
     #[test]
     fn toggles_flip() {
         let mut c = Config::default();
-        for set in [Setting::AutoHide, Setting::Seconds, Setting::Module("metrics"), Setting::Module("tray")] {
+        for set in [
+            Setting::AutoHide,
+            Setting::Previews,
+            Setting::Seconds,
+            Setting::Module("metrics"),
+            Setting::Module("tray"),
+        ] {
             let was = is_on(&c, set);
             flip(&mut c, set);
             assert_eq!(is_on(&c, set), !was);

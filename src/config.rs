@@ -162,6 +162,9 @@ pub struct PinnedApp {
 pub struct Config {
     pub position: Position,
     pub autohide: bool,
+    /// Window picker with live DWM thumbnails when the pointer rests on an app with 2+ windows
+    /// (`picker`). false = no hover timer is armed and no picker window is ever created.
+    pub window_previews: bool,
     pub hide_native_taskbar: bool,
     pub pinned: Vec<PinnedApp>,
     /// Name overrides: key = lowercase exe file name (e.g. "code.exe") or AUMID;
@@ -249,6 +252,7 @@ impl Default for Config {
         Config {
             position: Position::Bottom,
             autohide: true,
+            window_previews: true,
             hide_native_taskbar: true,
             pinned: Vec::new(),
             names: BTreeMap::new(),
@@ -474,6 +478,10 @@ fn render(c: &Config) -> String {
   // Hide the bar when the pointer leaves it, show it when you touch the screen edge.
   "autohide": {autohide},
 
+  // Resting the pointer on an app with several windows shows a live preview of each one (with its
+  // title); click a preview to switch to that window. false = no previews and no extra window.
+  "window_previews": {window_previews},
+
   // Hide Windows' own taskbar while the dock runs (restored when the dock exits).
   "hide_native_taskbar": {hide_native},
 
@@ -569,6 +577,7 @@ fn render(c: &Config) -> String {
         tray_size = c.tray_icon_size,
         module_size = c.module_size,
         autohide = c.autohide,
+        window_previews = c.window_previews,
         hide_native = c.hide_native_taskbar,
         show_date = c.show_date,
         time_format = js(&c.time_format),
@@ -925,7 +934,7 @@ mod tests {
     fn parse_partial_uses_defaults() {
         let c = parse("{\"position\":\"top\",\"pinned\":[{\"key\":\"a\"}]}").unwrap();
         assert_eq!(c.position, Position::Top);
-        assert!(c.autohide && c.show_date);
+        assert!(c.autohide && c.show_date && c.window_previews);
         assert_eq!(c.pinned[0].key, "a");
         assert!(c.pinned[0].icon.is_none());
     }
@@ -969,7 +978,9 @@ mod tests {
         c.module_size = 125;
         c.background = Background(0x2E1119);
         c.bar_opacity = 0;
+        c.window_previews = false;
         let r = render(&c);
+        assert!(r.contains("\"window_previews\": false"));
         assert!(r.contains("Get-StartApps") && r.contains("\"background\": \"#2E1119\""));
         assert!(!r.contains("\"bar_size\":"));
         assert_eq!(parse(&r).unwrap(), c);

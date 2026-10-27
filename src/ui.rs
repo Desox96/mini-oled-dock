@@ -28,6 +28,9 @@
 //!  * Themed context menu (`popup::open_app_menu`, command in `WM_DOCK_APP_MENU_CMD`): Pin/Unpin
 //!    (`config::pin/unpin`), New window, Close all windows (`apps::close_group`).
 //!    While the popup is open, auto-hide is suspended (`popup::is_open`).
+//!  * Window picker (`picker`): the pointer resting `PICKER_HOVER_MS` on an app with 2+ windows
+//!    (`TIMER_HOVER_PICKER`, one-shot, armed only then) opens live thumbnails of its windows; it
+//!    also suspends auto-hide and closes on a click on the bar, another item, or the bar hiding.
 //!  * DPI: `WM_DPICHANGED`/`WM_DISPLAYCHANGE` -> recompute metrics, fonts, icons, geometry.
 //!  * Auto-hide (screen edge, Win key, 2.5 s timeout); `config::effective_autohide()`
 //!    false = always visible.
@@ -71,7 +74,8 @@ use crate::icons::IconBitmap;
 use crate::log;
 use crate::msg::{
     ID_MENU_CLOSE_ALL, ID_MENU_NEW_WINDOW, ID_MENU_PIN, ID_MENU_UNPIN, TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK,
-    TIMER_POLL, TIMER_RECONCILE, TIMER_SYSMON, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD, WM_DOCK_SHELL_READY, WM_DOCK_VOLUME,
+    TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RECONCILE, TIMER_SYSMON, WM_DOCK_APPS_DIRTY, WM_DOCK_APP_MENU_CMD,
+    WM_DOCK_SHELL_READY, WM_DOCK_VOLUME,
 };
 use crate::popup::{self, Anchor, AppMenuInfo, PopupKind};
 use crate::render::{
@@ -102,6 +106,8 @@ const HOVER_ALPHA: u8 = 20;
 const PRESS_ALPHA: u8 = 36;
 /// Debounce after `WM_DOCK_APPS_DIRTY` (ms).
 const DEBOUNCE_MS: u32 = 100;
+/// Pointer resting on an app item with 2+ windows for this long opens the window picker (ms).
+const PICKER_HOVER_MS: u32 = 400;
 /// Periodic reconciliation of the window list (ms).
 const RECONCILE_MS: u32 = 5000;
 /// Timer for the bar width animation (local id, distinct from those in `msg`).
@@ -507,10 +513,12 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
         }
         WM_DPICHANGED => {
             let dpi = (wp.0 & 0xFFFF) as u32;
+            picker_cancel("display changed");
             apply_dpi(if dpi >= 96 { dpi } else { primary_dpi() });
             Some(LRESULT(0))
         }
         WM_DISPLAYCHANGE => {
+            picker_cancel("display changed");
             apply_dpi(primary_dpi());
             Some(LRESULT(0))
         }
@@ -544,6 +552,7 @@ fn on_timer(h: HWND, id: usize) -> Option<LRESULT> {
         TIMER_ATTN => on_attn_tick(h),
         TIMER_VIS => on_vis_tick(h),
         TIMER_SYSMON => sysmon_tick(),
+        TIMER_HOVER_PICKER => on_hover_picker_timer(h),
         TIMER_CLOCK => {
             if VISIBLE.load(Relaxed) && config::get().show_clock {
                 // Re-armed one-shot: SetTimer on the same id replaces the previous interval.
@@ -599,6 +608,12 @@ pub fn on_config_changed() {
         if let Some(g) = GEOM.with(|g| g.get()) {
             show_topmost(hwnd(), &g);
         }
+    }
+    // Window previews switched off: no hover timer, picker hidden.
+    if !config::get().window_previews {
+        picker_cancel("window previews off");
+        // Off = no timer and no window: destroy it (idempotent; `open` recreates it).
+        crate::picker::shutdown();
     }
     // The bar may have moved or resized under an open popup (Settings): keep it attached to its item.
     if let Some(a) = popup::current().and_then(item_for_popup).and_then(anchor_for) {
@@ -1237,6 +1252,11 @@ fn rebuild_entries() {
             set_timer(hwnd(), TIMER_ANIM, ANIM_TICK_MS);
         }
     });
+    // An open window picker whose app gained or lost windows closes (no live re-layout).
+    if let Some(k) = crate::picker::open_key() {
+        let wins = UI.with(|u| u.borrow().entries.iter().find(|e| e.group_key == k).map(|e| e.windows.clone()));
+        crate::picker::sync_windows(&k, wins.as_deref());
+    }
     request_missing();
 }
 
@@ -1503,12 +1523,76 @@ fn set_hover(hit: Option<ItemId>) {
         retarget_plate(&mut st.plate, t, now_ms());
         true
     });
+    if changed {
+        picker_hover(hit);
+    }
     // Entering a tray icon: a single hover notification to the app.
     if let (true, Some(ItemId::Tray(id))) = (changed, hit) {
         if let Some(p) = cursor_pos() {
             tray_host::hover(id, p);
         }
     }
+}
+
+// ------------------------------------------------------------------ window picker
+
+/// App item `hit` with 2+ windows -> (index, group key, name); `None` otherwise.
+fn multi_window_app(hit: Option<ItemId>) -> Option<(usize, String, String)> {
+    let Some(ItemId::App(i)) = hit else { return None };
+    UI.with(|u| {
+        let st = u.borrow();
+        st.entries.get(i).filter(|e| e.windows.len() >= 2).map(|e| (i, e.group_key.clone(), e.name.clone()))
+    })
+}
+
+/// The hover changed to `hit`. On an app with 2+ windows (previews on) the picker's open delay is
+/// (re)armed; back on the item of the open picker it stays open; on another item the picker closes
+/// at once; off the bar it closes by itself unless the pointer reaches it (`picker::arm_leave`).
+/// Anything else kills the delay: no timer runs unless the pointer rests on such an item.
+fn picker_hover(hit: Option<ItemId>) {
+    let target = if config::get().window_previews { multi_window_app(hit) } else { None };
+    let open = crate::picker::open_key();
+    if let (Some((_, k, _)), Some(o)) = (&target, &open) {
+        if k == o {
+            kill_timer(hwnd(), TIMER_HOVER_PICKER);
+            crate::picker::cancel_leave();
+            return;
+        }
+    }
+    if open.is_some() {
+        if hit.is_none() {
+            crate::picker::arm_leave();
+        } else {
+            crate::picker::close("hover moved to another item");
+        }
+    }
+    if target.is_some() && !popup::is_open() {
+        set_timer(hwnd(), TIMER_HOVER_PICKER, PICKER_HOVER_MS);
+    } else {
+        kill_timer(hwnd(), TIMER_HOVER_PICKER);
+    }
+}
+
+/// `TIMER_HOVER_PICKER` (one-shot): the pointer rested on an app with 2+ windows: open its picker.
+fn on_hover_picker_timer(h: HWND) {
+    kill_timer(h, TIMER_HOVER_PICKER);
+    let (hover, busy) = UI.with(|u| {
+        let st = u.borrow();
+        (st.hover, st.pressed.is_some() || st.drag.is_some())
+    });
+    if busy || !VISIBLE.load(Relaxed) || popup::is_open() || !config::get().window_previews {
+        return;
+    }
+    let Some((i, key, name)) = multi_window_app(hover) else { return };
+    let Some(a) = anchor_for(ItemId::App(i)) else { return };
+    let name = if name.is_empty() { "Window".to_string() } else { name };
+    crate::picker::open(a, &key, &name, &apps::windows_in_order(&key));
+}
+
+/// Kills the picker's open delay and closes the picker (click on the bar, dock hidden, previews off).
+fn picker_cancel(reason: &str) {
+    kill_timer(hwnd(), TIMER_HOVER_PICKER);
+    crate::picker::close(reason);
 }
 
 fn on_mouse_move(h: HWND, wp: WPARAM, lp: LPARAM) {
@@ -1580,6 +1664,7 @@ fn on_lbutton_down(h: HWND, lp: LPARAM) {
     // A drop still settling is committed right away.
     finish_drag(now_ms(), true);
     let hit = hit_at(lo_i16(lp), hi_i16(lp));
+    picker_cancel("click on the bar");
     // An open popup closes right away on a click on the bar outside its own item (the bar is
     // NOACTIVATE: the popup does not receive WA_INACTIVE). On its own item `toggle` handles it on release.
     if popup::is_open() {
@@ -1631,6 +1716,7 @@ fn on_lbutton_up(lp: LPARAM) {
 }
 
 fn on_mbutton_up(lp: LPARAM) {
+    picker_cancel("middle click on the bar");
     match hit_at(lo_i16(lp), hi_i16(lp)) {
         Some(ItemId::App(i)) => {
             if let Some(e) = entry_at(i) {
@@ -1647,6 +1733,7 @@ fn on_mbutton_up(lp: LPARAM) {
 }
 
 fn on_rbutton_up(lp: LPARAM) {
+    picker_cancel("right click on the bar");
     match hit_at(lo_i16(lp), hi_i16(lp)) {
         Some(ItemId::App(i)) => {
             if let Some(e) = entry_at(i) {
@@ -2428,6 +2515,7 @@ pub fn hide_dock(reason: &str) {
     let instant = FS_SHOWN.swap(false, Relaxed);
     let prev = if instant { FS_PREV.swap(0, Relaxed) } else { 0 };
     crate::popup::close("dock hidden");
+    picker_cancel("dock hidden");
     if instant {
         stop_vis_anim(0.0);
         hide_window(hwnd());
@@ -2775,6 +2863,7 @@ fn on_poll() {
         }
         if point_in(&bar, p)
             || crate::popup::is_open()
+            || crate::picker::is_open()
             || !autohide
             || tray_host::foreign_menu_active()
             || drag_active()
