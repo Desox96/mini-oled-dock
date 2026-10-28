@@ -46,6 +46,7 @@ mod metrics;
 mod msg;
 mod net;
 mod notif;
+mod picker;
 mod popup;
 mod popup_audio;
 mod popup_calendar;
@@ -93,9 +94,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use msg::{
-    TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_HOUSEKEEPING, TIMER_POLL, TIMER_RAM, TIMER_RECONCILE,
-    TIMER_SECOND, TIMER_TRAY_REANNOUNCE, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG, WM_DOCK_NOTIF, WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST,
-    WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED, WM_DOCK_WINKEY,
+    TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RAM,
+    TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG, WM_DOCK_NOTIF,
+    WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED,
+    WM_DOCK_WINKEY,
 };
 
 // ---------------------------------------------------------------- constants
@@ -642,6 +644,7 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
         TIMER_ANIM,
         TIMER_CLOCK,
         TIMER_TRAY_REANNOUNCE,
+        TIMER_HOVER_PICKER,
     ] {
         // SAFETY: our own id/window; fails harmlessly if the timer does not exist.
         let _ = unsafe { KillTimer(Some(h), id) };
@@ -651,6 +654,7 @@ fn cleanup(h: HWND, inst: HINSTANCE) {
     tray_host::stop();
     // The native taskbar right after: it is the thing that must not stay hidden.
     taskbar::shutdown();
+    picker::shutdown();
     popup::shutdown();
     // SAFETY: as above.
     let _ = unsafe { UnregisterHotKey(Some(h), HOTKEY_ID) };

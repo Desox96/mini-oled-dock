@@ -11,11 +11,12 @@
 //!
 //! HOOKs used in other people's files (marked `PREVIEW-HOOK`): `render::snapshot_pixels`,
 //! `Surface::snapshot_pixels`, `notif::preview_set_state`, `popup_tray::preview_new`,
-//! `popup_settings::preview_new`.
+//! `popup_settings::preview_new`, `picker::preview_pixels`.
 
 use std::path::Path;
 use std::sync::Arc;
 
+use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 use crate::audio::{DeviceKind, OutputDevice, VolumeState};
@@ -306,7 +307,8 @@ fn mock_drag(layout: &mut render::Layout) {
 
 /// Renders the bar with the hover plate on `hover` (if any) in the given display mode.
 /// `attention` = index of the app whose indicator is the orange "needs attention" bar.
-/// `drag` = mid-drag frame (app 1 lifted over an open gap).
+/// `drag` = mid-drag frame (app 1 lifted over an open gap). `top` = bar at the top of the screen.
+/// Returns the pixels and the rectangle of `hover` in the bar.
 fn render_bar(
     m: Metrics,
     hover: Option<ItemId>,
@@ -314,7 +316,8 @@ fn render_bar(
     attention: Option<usize>,
     drag: bool,
     net: NetStatus,
-) -> Option<(i32, i32, Vec<u32>)> {
+    top: bool,
+) -> Option<(i32, i32, Vec<u32>, Option<RECT>)> {
     // The renderer reads the display mode from the global config snapshot (in memory only, never saved).
     // The metrics module (off by default) is switched on so the preview shows every module.
     let mut cfg = Config { display_mode: mode, show_metrics: true, ..Config::default() };
@@ -349,7 +352,7 @@ fn render_bar(
         tray: &tray,
         overflow_enabled: true,
         force_chevron: true,
-        bar_top: true,
+        bar_top: top,
         system: SystemView {
             volume: VolumeState { level: 60, muted: false, available: true },
             show_volume_percent: true,
@@ -368,6 +371,7 @@ fn render_bar(
         max_width: m.px(1920 - 2 * render::EDGE_MARGIN),
     };
     let mut layout = render::layout(&scene);
+    let hover_rect = hover.and_then(|id| layout.rect_of(id));
     if drag {
         mock_drag(&mut layout);
         scene.lift = Some(Lift { id: ItemId::App(1), alpha: crate::surface::PRESS_ALPHA as u8 });
@@ -378,7 +382,7 @@ fn render_bar(
     let out = match render::resize(layout.width, layout.height) {
         Ok(()) => {
             render::paint(&scene, &layout);
-            render::snapshot_pixels()
+            render::snapshot_pixels().map(|(w, h, px)| (w, h, px, hover_rect))
         }
         Err(e) => {
             eprintln!("preview: render::resize failed: {e}");
@@ -401,12 +405,44 @@ fn bar_png(
     drag: bool,
     net: NetStatus,
 ) -> bool {
-    let Some((bw, bh, px)) = render_bar(m, hover, mode, attention, drag, net) else { return false };
+    let Some((bw, bh, px, _)) = render_bar(m, hover, mode, attention, drag, net, true) else { return false };
     let pad = m.px(48);
     let (cw, ch) = (bw + 2 * pad, bh + m.px(150));
     let by = m.px(render::EDGE_MARGIN);
     let mut bg = wallpaper(cw, ch, by + bh / 2);
     composite(&mut bg, cw, ch, &px, bw, bh, pad, by);
+    write_png(dir, file, cw, ch, bg)
+}
+
+/// Bar at the bottom with Firefox hovered and the window picker open above it: three cards with
+/// placeholder boxes where the DWM would compose the live thumbnails.
+fn picker_png(dir: &Path, file: &str, m: Metrics) -> bool {
+    let firefox = ItemId::App(2);
+    let Some((bw, bh, px, Some(item))) =
+        render_bar(m, Some(firefox), DisplayMode::IconText, None, false, mock_net().status(), false)
+    else {
+        return false;
+    };
+    let titles = [
+        "The Rust Programming Language - Mozilla Firefox",
+        "Pull requests - GitHub - Mozilla Firefox",
+        "Weather forecast for the week ahead in Turin, Italy - Mozilla Firefox",
+    ];
+    let sources = [Some((1920, 1080)), Some((1280, 1024)), Some((2560, 1080))];
+    let Some((pw, ph, pp)) = crate::picker::preview_pixels(m, &titles, &sources, bw, Some(1)) else {
+        eprintln!("preview: picker surface failed");
+        return false;
+    };
+    let pad = m.px(48);
+    let gap = m.px(crate::popup::POPUP_GAP);
+    let margin = m.px(render::EDGE_MARGIN);
+    let (cw, ch) = (bw + 2 * pad, ph + gap + bh + margin + m.px(40));
+    let by = ch - margin - bh;
+    let cx = pad + (item.left + item.right) / 2;
+    let px_ = (cx - pw / 2).clamp(m.px(8), (cw - m.px(8) - pw).max(m.px(8)));
+    let mut bg = wallpaper(cw, ch, m.px(20));
+    composite(&mut bg, cw, ch, &px, bw, bh, pad, by);
+    composite(&mut bg, cw, ch, &pp, pw, ph, px_, by - gap - ph);
     write_png(dir, file, cw, ch, bg)
 }
 
@@ -655,6 +691,8 @@ pub fn run(dir: &str) -> i32 {
             false,
             wifi,
         ));
+        crate::config::set(Config::default());
+        failures += i32::from(!picker_png(dir, &format!("popup_windows{suffix}.png"), m));
         // (name, index of the hovered control)
         for (name, nth) in [
             ("popup_notif", 1),

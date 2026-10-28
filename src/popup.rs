@@ -703,7 +703,7 @@ fn ensure_window() -> Option<HWND> {
 }
 
 /// Work area of the monitor containing `bar`.
-fn work_area(bar: &RECT) -> RECT {
+pub(crate) fn work_area(bar: &RECT) -> RECT {
     // SAFETY: `bar` is valid; MONITOR_DEFAULTTONEAREST always returns a monitor.
     let mon = unsafe { MonitorFromRect(bar, MONITOR_DEFAULTTONEAREST) };
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -715,8 +715,8 @@ fn work_area(bar: &RECT) -> RECT {
     }
 }
 
-/// Top-left corner position of a `w` x `h` popup.
-fn compute_pos(a: &Anchor, w: i32, h: i32) -> (i32, i32) {
+/// Top-left corner position of a `w` x `h` popup (also used by the window picker).
+pub(crate) fn compute_pos(a: &Anchor, w: i32, h: i32) -> (i32, i32) {
     let m = Metrics { dpi: a.dpi };
     let work = work_area(&a.bar);
     let margin = m.px(POPUP_SCREEN_MARGIN);
@@ -731,8 +731,9 @@ fn compute_pos(a: &Anchor, w: i32, h: i32) -> (i32, i32) {
 }
 
 fn open(kind: PopupKind, anchor: Anchor) {
-    // Any other popup closes without a fade.
+    // Any other popup closes without a fade; so does the window picker.
     close_inner("popup switch");
+    crate::picker::close("popup opened");
     let Some(hwnd) = ensure_window() else { return };
     let metrics = Metrics { dpi: anchor.dpi.max(96) };
     let surf = match Surface::new(metrics) {

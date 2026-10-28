@@ -4,7 +4,7 @@ A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust
 
 ![The bar](docs/screenshots/bar_top_icon_text.png)
 
-It replaces the native taskbar with a small centred pill that hides when you do not need it. Backgrounds are pure black (OLED pixels switch off), only program names are shown (never window titles), tray icons of other apps are hosted in the bar, and the popups are drawn by hand. The executable is about 0.7 MB and uses roughly 10 MB of RAM (working set trimmed to under 1 MB while hidden); numbers from the author's machine.
+It replaces the native taskbar with a small centred pill that hides when you do not need it. Backgrounds are pure black (OLED pixels switch off), only program names are shown in the bar (window titles appear only in the previews that open when you hover an app with several windows), tray icons of other apps are hosted in the bar, and the popups are drawn by hand. The executable is about 0.7 MB and uses roughly 10 MB of RAM (working set trimmed to under 1 MB while hidden); numbers from the author's machine.
 
 *Screenshots are rendered offscreen by `dock.exe --preview` with mock data.*
 
@@ -20,17 +20,22 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 |---|---|
 | ![](docs/screenshots/popup_tray_customize.png) | ![](docs/screenshots/popup_start.png) |
 
+| Window previews |
+|---|
+| ![](docs/screenshots/popup_windows.png) |
+
 ## Features
 
 - Centred bar sized to its content: pinned apps first, then open apps. An underline marks open windows (orange when an app asks for attention).
 - Display modes: icon + name, icon only, or name only.
 - Independent sizes for app icons, app names, tray icons and the system modules (the bar height follows the tallest content); background colour from dark presets or any colour through a built-in picker (pure black by default); background opacity from 0 to 100 %.
-- **Settings popup** (from the power button): every option above, auto-hide, clock seconds and the visible modules, applied live.
+- **Settings popup** (from the power button): every option above, auto-hide, window previews, clock seconds and the visible modules, applied live.
 - Network module: Wi-Fi signal bars or ethernet, with a small globe when the internet is reachable (an x when it is not); click for name, IPv4 and signal.
 - System metrics module (off by default): CPU and RAM usage in percent; click opens Task Manager.
 - Drag and drop reordering of apps, tray icons and system modules.
 - Tray icon hosting, with an overflow popup and a view to choose which icons are visible.
 - Popups: notifications (with Do not disturb), audio (volume, mute, output device), calendar, network, power, settings, and an app menu (new window, pin / unpin, close).
+- Window previews: hovering an app with several windows shows live DWM thumbnails with titles; click one to switch; off = no timer, no window.
 - Disabled features cost nothing: a hidden module has no timer, no polling and loads no system library; the network and metrics modules are polled only while the bar is visible.
 - Show desktop button.
 - Start button at the left end of the bar (before the apps): left click opens Start, right click opens a quick-links menu like the native Win+X one (Installed apps, Device Manager, Terminal (admin), PowerShell (admin), Task Manager, Settings, File Explorer, Search, Run, Sign out, ...), in Italian when the Windows display language is Italian and in English otherwise.
@@ -69,11 +74,11 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 ## Usage
 
 - **Show / hide:** Win key alone, or the screen edge.
-- **App entries:** left click activates, minimises or cycles windows; middle click starts a new instance; right click opens the app menu.
+- **App entries:** left click activates, minimises or cycles windows; middle click starts a new instance; right click opens the app menu; resting the pointer on an app with several windows shows a preview of each (click one to switch to it).
 - **Volume:** wheel changes it, middle click mutes, left click opens the audio popup.
 - **Network:** left click opens the network popup (connection, internet, IPv4, signal, "Network settings"); right click opens Windows' network settings.
 - **System metrics:** click opens Task Manager.
-- **Settings:** power button, then **Settings**: position, display mode, auto-hide, clock seconds, one switch per module, **Choose tray icons** (which tray icons stay in the bar) and two sub-pages:
+- **Settings:** power button, then **Settings**: position, display mode, auto-hide, window previews, clock seconds, one switch per module, **Choose tray icons** (which tray icons stay in the bar) and two sub-pages:
   - **Background ›**: seven dark presets (Black, Graphite, Slate, Navy, Plum, Wine, Forest) and a custom swatch that opens a colour picker (saturation/value square, hue strip, preview and hex code; drag to pick), plus the **Opacity** slider (0-100 %, background only: at 0 % only text and icons are visible and the bar still reacts to the mouse).
   - **Sizes ›**: sliders for app icons, app names, tray icons and modules, and **Reset sizes**.
 
@@ -97,6 +102,7 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | `background` | `"#000000"` | Background colour of the bar and the popups, `"#RRGGBB"` (the old values `"black"` and `"dark"` are still accepted) |
 | `bar_opacity` | `95` | Bar background opacity in percent, 0-100 (text and icons stay opaque) |
 | `autohide` | `true` | Hide the bar when the pointer leaves it |
+| `window_previews` | `true` | Live previews of an app's windows when the pointer rests on an app with two or more |
 | `hide_native_taskbar` | `true` | Hide the Windows taskbar while the dock runs |
 | `show_date` / `date_format` | `true` / `"ddd d MMM"` | Date under the time (Windows date picture) |
 | `time_format` / `show_seconds` | `"HH:mm"` / `false` | Clock format (Windows time picture) |
