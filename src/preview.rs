@@ -29,6 +29,7 @@ use crate::popup::{Content, DataEvent};
 use crate::popup_settings::Page;
 use crate::render::{self, AppView, BarSizes, Indicator, ItemId, Lift, Metrics, Plate, Scene, SystemView, TrayIcon};
 use crate::surface::Surface;
+use crate::ui::Screen;
 
 thread_local! {
     /// Bar style of the next `render_bar` (sizes, background, opacity): applied to the config of the
@@ -520,7 +521,8 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             ..Default::default()
         }),
         "popup_power" => crate::popup_power::new(),
-        "popup_settings" => crate::popup_settings::new(),
+        // No displays passed: no "Screen" row, whatever monitors this machine has.
+        "popup_settings" => crate::popup_settings::preview_with_screens(Vec::new()),
         "popup_settings_navy" => {
             crate::config::set(Config {
                 background: Background(0x0E1A33),
@@ -529,7 +531,16 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
                 autohide: false,
                 ..Config::default()
             });
-            crate::popup_settings::new()
+            crate::popup_settings::preview_with_screens(Vec::new())
+        }
+        "popup_settings_screen" => {
+            // Two mock displays, bar moved to the second one.
+            crate::config::set(Config { monitor: "\\\\.\\DISPLAY2".into(), ..Config::default() });
+            let d = |device: &str, label, primary| Screen { device: device.into(), label, primary };
+            crate::popup_settings::preview_with_screens(vec![
+                d("\\\\.\\DISPLAY1", "1", true),
+                d("\\\\.\\DISPLAY2", "2", false),
+            ])
         }
         "popup_settings_background" => {
             crate::config::set(Config { background: Background(0x2A1F3D), bar_opacity: 60, ..Config::default() });
@@ -703,6 +714,7 @@ pub fn run(dir: &str) -> i32 {
             ("popup_power", 4),
             ("popup_settings", 3),
             ("popup_settings_navy", 2),
+            ("popup_settings_screen", 2),
             ("popup_settings_background", 4),
             ("popup_settings_presets", 3),
             ("popup_settings_sizes", 5),

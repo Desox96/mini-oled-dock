@@ -400,6 +400,15 @@ pub(crate) fn preview_new(page: Page, picker_open: bool) -> Box<dyn Content> {
     Box::new(p)
 }
 
+// PREVIEW-HOOK (used by `preview.rs`): the main page with `screens` in place of the connected
+// displays, so the "Screen" row (shown only with two or more) is the same on every machine.
+pub(crate) fn preview_with_screens(screens: Vec<Screen>) -> Box<dyn Content> {
+    let mut p = SettingsPopup::at(Page::Main);
+    p.screens = screens;
+    p.items = items(&p.cfg, p.page, p.picker_open, &p.screens);
+    Box::new(p)
+}
+
 /// Id of item `i` (and of its part `part`, if any).
 fn item_id(i: usize, part: Option<usize>) -> u32 {
     (i as u32 + 1) * ID_STRIDE + part.map_or(0, |j| j as u32 + 1)

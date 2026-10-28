@@ -20,14 +20,15 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 |---|---|
 | ![](docs/screenshots/popup_tray_customize.png) | ![](docs/screenshots/popup_start.png) |
 
-| Window previews |
-|---|
-| ![](docs/screenshots/popup_windows.png) |
+| Window previews | Settings: choose the screen |
+|---|---|
+| ![](docs/screenshots/popup_windows.png) | ![](docs/screenshots/popup_settings_screen.png) |
 
 ## Features
 
 - Centred bar sized to its content: pinned apps first, then open apps. An underline marks open windows (orange when an app asks for attention).
 - Display modes: icon + name, icon only, or name only.
+- Multi-monitor: the bar can sit on any connected display (Settings → **Screen**: **Main** or the display number) and follows that display's DPI; a display that is disconnected falls back to the primary one.
 - Independent sizes for app icons, app names, tray icons and the system modules (the bar height follows the tallest content); background colour from dark presets or any colour through a built-in picker (pure black by default); background opacity from 0 to 100 %.
 - **Settings popup** (from the power button): every option above, auto-hide, window previews, clock seconds and the visible modules, applied live.
 - Network module: Wi-Fi signal bars or ethernet, with a small globe when the internet is reachable (an x when it is not); click for name, IPv4 and signal.
