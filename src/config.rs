@@ -161,6 +161,9 @@ pub struct PinnedApp {
 #[serde(default)]
 pub struct Config {
     pub position: Position,
+    /// Display the bar sits on: empty = the primary monitor (default), otherwise a GDI device name
+    /// such as "\\.\DISPLAY2". A display that is not connected falls back to the primary one.
+    pub monitor: String,
     pub autohide: bool,
     pub hide_native_taskbar: bool,
     pub pinned: Vec<PinnedApp>,
@@ -248,6 +251,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             position: Position::Bottom,
+            monitor: String::new(),
             autohide: true,
             hide_native_taskbar: true,
             pinned: Vec::new(),
@@ -447,6 +451,11 @@ fn render(c: &Config) -> String {
   // Where the bar sits on screen: "top" or "bottom".
   "position": "{pos}",
 
+  // Display the bar sits on: "" = the primary monitor, or a device name such as "\\\\.\\DISPLAY2".
+  // Normally chosen in Settings -> Screen (shown with two or more displays). If that display is
+  // not connected the bar uses the primary monitor, and moves back when it returns.
+  "monitor": {monitor},
+
   // What each entry shows: "icon_text" (icon + name), "icon" (icon only) or "text" (name only).
   // The indicator bar under each entry adapts to the chosen mode.
   "display_mode": "{mode}",
@@ -563,6 +572,7 @@ fn render(c: &Config) -> String {
   "notif_prompted": {notif}
 }}
 "#,
+        monitor = js(&c.monitor),
         opacity = c.bar_opacity.min(100),
         icon_size = c.app_icon_size,
         text_size = c.app_text_size,
@@ -963,6 +973,7 @@ mod tests {
         c.show_seconds = true;
         c.display_mode = DisplayMode::Text;
         c.position = Position::Top;
+        c.monitor = "\\\\.\\DISPLAY2".into();
         c.app_icon_size = 24;
         c.app_text_size = 11;
         c.tray_icon_size = 20;

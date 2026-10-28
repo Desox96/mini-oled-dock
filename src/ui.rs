@@ -29,6 +29,8 @@
 //!    (`config::pin/unpin`), New window, Close all windows (`apps::close_group`).
 //!    While the popup is open, auto-hide is suspended (`popup::is_open`).
 //!  * DPI: `WM_DPICHANGED`/`WM_DISPLAYCHANGE` -> recompute metrics, fonts, icons, geometry.
+//!  * Display: the bar sits on `config.monitor` (`dock_hmonitor`), the primary monitor when it is
+//!    empty or that display is not connected; `WM_DISPLAYCHANGE` moves it when displays come and go.
 //!  * Auto-hide (screen edge, Win key, 2.5 s timeout); `config::effective_autohide()`
 //!    false = always visible.
 //!
@@ -38,12 +40,13 @@
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering::Relaxed};
 
+use windows::core::BOOL;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
-    MONITOR_DEFAULTTOPRIMARY,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
+    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::System::Threading::AttachThreadInput;
@@ -54,6 +57,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, TME_LEAVE, TRACKMOUSEEVENT, VIRTUAL_KEY,
     VK_ESCAPE, VK_F15, VK_LBUTTON, VK_LWIN, VK_RBUTTON,
 };
+use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DeregisterShellHookWindow, GetClassNameW, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW,
     GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
@@ -160,14 +164,14 @@ static SHELLHOOK_MSG: AtomicU32 = AtomicU32::new(0);
 /// Tick (ms) of the last new attention request: origin of the blink phase.
 static ATTN_START: AtomicU64 = AtomicU64::new(0);
 
-/// Geometry of the dock and of the primary monitor (physical pixels, per-monitor DPI).
+/// Geometry of the dock and of its display (physical pixels, per-monitor DPI).
 #[derive(Clone, Copy, Debug)]
 pub struct Geom {
     pub x: i32,
     pub y: i32,
     pub w: i32,
     pub h: i32,
-    /// Rectangle of the primary monitor.
+    /// Rectangle of the bar's display (`config.monitor`, primary by default).
     pub mon: RECT,
 }
 
@@ -329,6 +333,8 @@ struct UiState {
 
 thread_local! {
     static GEOM: Cell<Option<Geom>> = const { Cell::new(None) };
+    /// HMONITOR (as isize) the bar was last placed on, to log a display change once.
+    static LAST_HMON: Cell<isize> = const { Cell::new(0) };
     static POLL_TICKS: Cell<u32> = const { Cell::new(0) };
     static VIS: Cell<VisAnim> = const { Cell::new(VisAnim { from: 0.0, to: 0.0, start: 0, dur: 1, running: false }) };
     /// Windows that asked for attention (FlashWindowEx) and were not activated yet.
@@ -363,11 +369,11 @@ fn now_ms() -> u64 {
 
 // ------------------------------------------------------------------ public API
 
-/// Prepares the UI state BEFORE the window exists: primary monitor DPI, provisional geometry
+/// Prepares the UI state BEFORE the window exists: DPI of the bar's display, provisional geometry
 /// (centered bar, provisional width). Returns the `Geom` to create the window with.
 /// Called by `main::run` after `config::init()`.
 pub fn init() -> Result<Geom, String> {
-    let dpi = primary_dpi();
+    let dpi = dock_dpi();
     let sizes = BarSizes::from_config(&config::get());
     UI.with(|u| {
         let st = &mut *u.borrow_mut();
@@ -507,11 +513,12 @@ pub fn handle_message(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESU
         }
         WM_DPICHANGED => {
             let dpi = (wp.0 & 0xFFFF) as u32;
-            apply_dpi(if dpi >= 96 { dpi } else { primary_dpi() });
+            apply_dpi(if dpi >= 96 { dpi } else { dock_dpi() });
             Some(LRESULT(0))
         }
         WM_DISPLAYCHANGE => {
-            apply_dpi(primary_dpi());
+            // Also a display plugged in or out: the bar moves to (or back to) its chosen display.
+            apply_dpi(dock_dpi());
             Some(LRESULT(0))
         }
         WM_SETTINGCHANGE => {
@@ -578,8 +585,10 @@ pub fn on_config_changed() {
         let st = u.borrow();
         (st.monitor_dpi, st.sizes)
     });
-    if mon >= 96 && BarSizes::from_config(&config::get()) != cur {
-        apply_dpi(mon);
+    // A different display (`monitor`) may also have a different DPI.
+    let dpi = dock_dpi();
+    if mon >= 96 && (dpi != mon || BarSizes::from_config(&config::get()) != cur) {
+        apply_dpi(dpi);
     }
     // Volume / notification modules switched: create or release their threads and COM objects.
     modules_sync();
@@ -805,7 +814,7 @@ pub fn redraw() {
         let st = u.borrow();
         (st.metrics.dpi, st.sizes)
     });
-    let mi = match primary_monitor() {
+    let mi = match dock_monitor() {
         Ok(mi) => mi,
         Err(e) => {
             log!("redraw: {e}");
@@ -2284,10 +2293,91 @@ fn config_top() -> bool {
     config::effective_position() == config::Position::Top
 }
 
-/// Effective DPI of the primary monitor (96 if the call fails).
-fn primary_dpi() -> u32 {
+/// A display the bar can sit on (Settings -> Screen, `config.monitor`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Screen {
+    /// GDI device name, e.g. "\\.\DISPLAY2" (the value stored in `config.monitor`).
+    pub device: String,
+    /// Short label: the display number Windows puts in the device name ("2"), or its position.
+    pub label: &'static str,
+    pub primary: bool,
+}
+
+/// Displays offered by the Settings popup (more are ignored: the segments would not fit).
+const MAX_SCREENS: usize = 6;
+const SCREEN_LABELS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+/// Every connected display with its `MONITORINFOEXW`, in enumeration order.
+fn enum_monitors() -> Vec<(HMONITOR, MONITORINFOEXW)> {
+    unsafe extern "system" fn add(h: HMONITOR, _: HDC, _: *mut RECT, lp: LPARAM) -> BOOL {
+        // SAFETY: `lp` is the `&mut Vec` passed below, alive for the whole (synchronous) enumeration.
+        let out = unsafe { &mut *(lp.0 as *mut Vec<(HMONITOR, MONITORINFOEXW)>) };
+        let mut mi = MONITORINFOEXW::default();
+        mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: `mi` is a writable MONITORINFOEXW whose cbSize says so.
+        if unsafe { GetMonitorInfoW(h, &mut mi.monitorInfo) }.as_bool() {
+            out.push((h, mi));
+        }
+        BOOL(1)
+    }
+    let mut out: Vec<(HMONITOR, MONITORINFOEXW)> = Vec::new();
+    // SAFETY: the callback only touches `out` through `lp`, and only during this call.
+    let _ = unsafe { EnumDisplayMonitors(None, None, Some(add), LPARAM(&mut out as *mut _ as isize)) };
+    out
+}
+
+fn device_name(mi: &MONITORINFOEXW) -> String {
+    let n = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(mi.szDevice.len());
+    String::from_utf16_lossy(&mi.szDevice[..n])
+}
+
+/// Label of the display named `device` ("\\.\DISPLAY2" -> "2"); `idx` (0-based) if it has no number.
+fn screen_label(device: &str, idx: usize) -> &'static str {
+    let digits: String =
+        device.chars().rev().take_while(|c| c.is_ascii_digit()).collect::<Vec<_>>().into_iter().rev().collect();
+    let n = digits.parse::<usize>().ok().filter(|n| (1..=SCREEN_LABELS.len()).contains(n)).unwrap_or(idx + 1);
+    SCREEN_LABELS[(n - 1).min(SCREEN_LABELS.len() - 1)]
+}
+
+/// Connected displays: the primary first, then the others by device name. At most `MAX_SCREENS`.
+pub fn screens() -> Vec<Screen> {
+    let mut v: Vec<(bool, String)> = enum_monitors()
+        .iter()
+        .map(|(_, mi)| (mi.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0, device_name(mi)))
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    v.truncate(MAX_SCREENS);
+    v.into_iter()
+        .enumerate()
+        .map(|(i, (primary, device))| Screen { label: screen_label(&device, i), device, primary })
+        .collect()
+}
+
+/// The display the bar belongs on: `config.monitor` if it is connected, otherwise the primary one.
+fn dock_hmonitor() -> HMONITOR {
+    let want = config::get().monitor.clone();
+    let found = if want.is_empty() {
+        None
+    } else {
+        enum_monitors().into_iter().find(|(_, mi)| device_name(mi).eq_ignore_ascii_case(&want)).map(|(h, _)| h)
+    };
     // SAFETY: MonitorFromPoint with MONITOR_DEFAULTTOPRIMARY always returns a monitor.
-    let mon = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+    let h = found.unwrap_or_else(|| unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) });
+    // Logged only when the display actually changes (chosen, unplugged, plugged back).
+    let prev = LAST_HMON.with(|c| c.replace(h.0 as isize));
+    if prev != h.0 as isize {
+        if found.is_none() && !want.is_empty() {
+            log!("monitor: \"{want}\" not connected, the bar uses the primary monitor");
+        } else {
+            log!("monitor: the bar uses {}", if want.is_empty() { "the primary monitor" } else { want.as_str() });
+        }
+    }
+    h
+}
+
+/// Effective DPI of the bar's display (96 if the call fails).
+fn dock_dpi() -> u32 {
+    let mon = dock_hmonitor();
     let (mut dx, mut dy) = (96u32, 96u32);
     // SAFETY: `dx`/`dy` are valid, writable u32s for the duration of the call.
     match unsafe { GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) } {
@@ -2296,9 +2386,8 @@ fn primary_dpi() -> u32 {
     }
 }
 
-fn primary_monitor() -> Result<MONITORINFO, String> {
-    // SAFETY: MonitorFromPoint with MONITOR_DEFAULTTOPRIMARY always returns a monitor.
-    let mon = unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) };
+fn dock_monitor() -> Result<MONITORINFO, String> {
+    let mon = dock_hmonitor();
     let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
     // SAFETY: `mi` has cbSize initialized and is writable.
     if !unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
@@ -2307,10 +2396,10 @@ fn primary_monitor() -> Result<MONITORINFO, String> {
     Ok(mi)
 }
 
-/// Geometry: bar of `bar_w` physical px, horizontally centered on the primary monitor's
-/// work area, `render::bar_height` tall, `EDGE_MARGIN` logical from the edge (bottom or top).
+/// Geometry: bar of `bar_w` physical px, horizontally centered on the work area of the bar's
+/// display, `render::bar_height` tall, `EDGE_MARGIN` logical from the edge (bottom or top).
 fn compute_geom(top: bool, bar_w: i32, dpi: u32, sizes: BarSizes) -> Result<Geom, String> {
-    geom_from(&primary_monitor()?, top, bar_w, dpi, sizes)
+    geom_from(&dock_monitor()?, top, bar_w, dpi, sizes)
 }
 
 fn geom_from(mi: &MONITORINFO, top: bool, bar_w: i32, dpi: u32, sizes: BarSizes) -> Result<Geom, String> {
@@ -2792,7 +2881,7 @@ fn on_poll() {
             reassert_topmost(hwnd());
         }
     }
-    // Screen edge: y==top (bar at the top) or y==bottom-1 (bar at the bottom), on the primary monitor.
+    // Screen edge: y==top (bar at the top) or y==bottom-1 (bar at the bottom), on the bar's display.
     let edge_y = if config_top() { g.mon.top } else { g.mon.bottom - 1 };
     let at_edge = p.y == edge_y && p.x >= g.mon.left && p.x < g.mon.right && edge_is_screen_border(&g, p.x);
     if !at_edge {
