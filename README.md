@@ -78,7 +78,7 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 - **Volume:** wheel changes it, middle click mutes, left click opens the audio popup.
 - **Network:** left click opens the network popup (connection, internet, IPv4, signal, "Network settings"); right click opens Windows' network settings.
 - **System metrics:** click opens Task Manager.
-- **Settings:** power button, then **Settings**: position, display mode, auto-hide, window previews, clock seconds, one switch per module, **Choose tray icons** (which tray icons stay in the bar) and two sub-pages:
+- **Settings:** power button, then **Settings**: position, screen (with two or more displays: **Main** or the display number), display mode, auto-hide, window previews, clock seconds, one switch per module, **Choose tray icons** (which tray icons stay in the bar) and two sub-pages:
   - **Background ›**: seven dark presets (Black, Graphite, Slate, Navy, Plum, Wine, Forest) and a custom swatch that opens a colour picker (saturation/value square, hue strip, preview and hex code; drag to pick), plus the **Opacity** slider (0-100 %, background only: at 0 % only text and icons are visible and the bar still reacts to the mouse).
   - **Sizes ›**: sliders for app icons, app names, tray icons and modules, and **Reset sizes**.
 
@@ -94,6 +94,7 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | Option | Default | Meaning |
 |---|---|---|
 | `position` | `"bottom"` | `"top"` or `"bottom"` |
+| `monitor` | `""` | Display the bar sits on: `""` = primary monitor, or a device name such as `"\\\\.\\DISPLAY2"`. A display that is not connected falls back to the primary one |
 | `display_mode` | `"icon_text"` | `"icon_text"`, `"icon"` or `"text"` |
 | `app_icon_size` | `16` | App icon size in logical px, 14-32 |
 | `app_text_size` | `13` | App name text size in logical px, 10-18 |
@@ -149,7 +150,7 @@ Stop-Process -Name explorer -Force; Start-Process explorer
 
 ## Limitations
 
-- Primary monitor only; the dock does not reserve work area, so maximised windows go under the bar.
+- One bar, on one display (the primary monitor unless another is chosen in Settings); the dock does not reserve work area, so maximised windows go under the bar.
 - The notification list needs Windows notification access (asked once). Switching the audio output and Do not disturb use undocumented COM interfaces that a Windows update could break.
 - Tray hosting only works while the native taskbar is hidden.
 - Developed and tested on Windows 11 only.

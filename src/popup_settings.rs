@@ -31,6 +31,7 @@ use crate::log;
 use crate::msg::WM_DOCK_CONFIG_APPLY;
 use crate::popup::{self, center_y, hline, lift, row_plate, tick_ms, toggle_switch, Content, HitMap, PopupKind, Reply};
 use crate::surface::{rect_wh, Font, Surface, PRESS_ALPHA, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, TEXT_COL, WHITE};
+use crate::ui::Screen;
 
 /// Popup width (logical px).
 const WIDTH: i32 = 260;
@@ -79,6 +80,8 @@ pub(crate) enum Page {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Setting {
     Position,
+    /// Display the bar sits on (`config.monitor`); offered only with two or more displays.
+    Monitor,
     Display,
     AutoHide,
     Previews,
@@ -122,13 +125,16 @@ enum Item {
     ResetSizes,
 }
 
-/// Rows of page `page` for the config `c` (the tray link only while the tray is on).
-fn items(c: &Config, page: Page, picker_open: bool) -> Vec<Item> {
+/// Rows of page `page` for the config `c` (the tray link only while the tray is on, the screen
+/// choice only with two or more displays `sc`).
+fn items(c: &Config, page: Page, picker_open: bool, sc: &[Screen]) -> Vec<Item> {
     match page {
         Page::Main => {
-            let mut v = vec![
-                Item::Section("Appearance"),
-                Item::Choice(Setting::Position, "Position"),
+            let mut v = vec![Item::Section("Appearance"), Item::Choice(Setting::Position, "Position")];
+            if sc.len() > 1 {
+                v.push(Item::Choice(Setting::Monitor, "Screen"));
+            }
+            v.extend([
                 Item::Choice(Setting::Display, "Display"),
                 Item::Open(Page::Background, "Background"),
                 Item::Open(Page::Sizes, "Sizes"),
@@ -139,7 +145,7 @@ fn items(c: &Config, page: Page, picker_open: bool) -> Vec<Item> {
                 Item::Section("Modules"),
                 // The Start button is a fixed item at the left end of the bar, not part of `MODULE_NAMES`.
                 Item::Toggle(Setting::Module("start"), module_label("start")),
-            ];
+            ]);
             v.extend(config::MODULE_NAMES.iter().map(|n| Item::Toggle(Setting::Module(n), module_label(n))));
             if c.show_tray {
                 v.push(Item::TrayChooser);
@@ -180,19 +186,24 @@ fn module_label(name: &str) -> &'static str {
     }
 }
 
-/// Labels of the segments of a choice.
-fn options(s: Setting) -> &'static [&'static str] {
+/// Labels of the segments of a choice (`sc`: the displays, for the screen choice).
+fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
     match s {
-        Setting::Position => &["Top", "Bottom"],
-        Setting::Display => &["Icon + name", "Icon", "Name"],
-        _ => &[],
+        Setting::Position => vec!["Top", "Bottom"],
+        Setting::Monitor => sc.iter().map(|d| if d.primary { "Main" } else { d.label }).collect(),
+        Setting::Display => vec!["Icon + name", "Icon", "Name"],
+        _ => Vec::new(),
     }
 }
 
-/// Selected segment of a choice.
-fn selected(c: &Config, s: Setting) -> Option<usize> {
+/// Selected segment of a choice. Screen: the chosen display, or "Main" (the primary, first in `sc`)
+/// when none is chosen or the chosen one is not connected (that is where the bar is).
+fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
     Some(match s {
         Setting::Position => usize::from(c.position == Position::Bottom),
+        Setting::Monitor => {
+            sc.iter().position(|d| !d.primary && d.device.eq_ignore_ascii_case(&c.monitor)).unwrap_or(0)
+        }
         Setting::Display => match c.display_mode {
             DisplayMode::IconText => 0,
             DisplayMode::Icon => 1,
@@ -202,10 +213,14 @@ fn selected(c: &Config, s: Setting) -> Option<usize> {
     })
 }
 
-/// Sets segment `j` of choice `s`.
-fn choose(c: &mut Config, s: Setting, j: usize) {
+/// Sets segment `j` of choice `s`. Screen: the primary is stored as "" (the bar then follows the
+/// primary monitor even if Windows changes which one it is).
+fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
     match s {
         Setting::Position => c.position = if j == 0 { Position::Top } else { Position::Bottom },
+        Setting::Monitor => {
+            c.monitor = sc.get(j).filter(|d| !d.primary).map(|d| d.device.clone()).unwrap_or_default();
+        }
         Setting::Display => {
             c.display_mode = [DisplayMode::IconText, DisplayMode::Icon, DisplayMode::Text][j.min(2)];
         }
@@ -350,6 +365,8 @@ pub(crate) struct SettingsPopup {
     cfg: Arc<Config>,
     page: Page,
     picker_open: bool,
+    /// Connected displays, read when the popup opens (`ui::screens`).
+    screens: Vec<Screen>,
     /// Picker colour as HSV, kept apart from the RGB value so the hue survives greys and black.
     hsv: (f32, f32, f32),
     items: Vec<Item>,
@@ -379,7 +396,7 @@ pub(crate) fn new() -> Box<dyn Content> {
 pub(crate) fn preview_new(page: Page, picker_open: bool) -> Box<dyn Content> {
     let mut p = SettingsPopup::at(page);
     p.picker_open = picker_open && page == Page::Background;
-    p.items = items(&p.cfg, p.page, p.picker_open);
+    p.items = items(&p.cfg, p.page, p.picker_open, &p.screens);
     Box::new(p)
 }
 
@@ -406,8 +423,10 @@ impl SettingsPopup {
     fn at(page: Page) -> SettingsPopup {
         let cfg = config::get();
         let picker_open = page == Page::Background && preset_index(cfg.background).is_none();
+        let screens = crate::ui::screens();
         SettingsPopup {
-            items: items(&cfg, page, picker_open),
+            items: items(&cfg, page, picker_open, &screens),
+            screens,
             hsv: rgb_to_hsv(cfg.background.rgb()),
             cfg,
             page,
@@ -426,9 +445,12 @@ impl SettingsPopup {
     }
 
     /// Segment widths of choice `s` (physical px).
-    fn seg_widths(s: &Surface, set: Setting) -> Vec<i32> {
+    fn seg_widths(&self, s: &Surface, set: Setting) -> Vec<i32> {
         let m = s.metrics();
-        options(set).iter().map(|o| (s.text_width(o, Font::Small) + 2 * m.px(SEG_PAD)).max(m.px(30))).collect()
+        options(set, &self.screens)
+            .iter()
+            .map(|o| (s.text_width(o, Font::Small) + 2 * m.px(SEG_PAD)).max(m.px(30)))
+            .collect()
     }
 
     /// Applies `f` to the config. `save`: written now through the commented template; otherwise set
@@ -461,7 +483,7 @@ impl SettingsPopup {
             crate::popup::tick_soon((APPLY_THROTTLE_MS - now.saturating_sub(self.last_apply)) as u32 + 5);
         }
         self.cfg = config::get();
-        self.items = items(&self.cfg, self.page, self.picker_open);
+        self.items = items(&self.cfg, self.page, self.picker_open, &self.screens);
         Reply::Relayout
     }
 
@@ -482,7 +504,7 @@ impl SettingsPopup {
         self.cfg = config::get();
         self.picker_open = page == Page::Background && preset_index(self.cfg.background).is_none();
         self.hsv = rgb_to_hsv(self.cfg.background.rgb());
-        self.items = items(&self.cfg, page, self.picker_open);
+        self.items = items(&self.cfg, page, self.picker_open, &self.screens);
         Reply::Relayout
     }
 
@@ -623,7 +645,7 @@ impl Content for SettingsPopup {
                 Item::Section(_) | Item::ColourSection => {}
                 Item::Choice(set, _) => {
                     // Segments right-aligned on the switches' right edge.
-                    let ws = Self::seg_widths(s, set);
+                    let ws = self.seg_widths(s, set);
                     let sh = m.px(SEG_H);
                     let mut x = rc.right - m.px(12) - ws.iter().sum::<i32>();
                     let sy = y + (h - sh) / 2;
@@ -701,8 +723,9 @@ impl Content for SettingsPopup {
                 }
                 Item::Choice(set, label) => {
                     s.text(label, col, center_y(&row, ln), Font::Normal, WHITE, TEXT_ALPHA);
-                    let sel = selected(&self.cfg, set);
-                    let n = options(set).len();
+                    let sel = selected(&self.cfg, set, &self.screens);
+                    let opts = options(set, &self.screens);
+                    let n = opts.len();
                     let (Some(first), Some(last)) =
                         (self.hits.rect(item_id(i, Some(0))), self.hits.rect(item_id(i, Some(n - 1))))
                     else {
@@ -712,7 +735,7 @@ impl Content for SettingsPopup {
                     let r = (track.bottom - track.top) / 2;
                     s.fill_rr(track, r, WHITE, SEG_TRACK_ALPHA);
                     s.stroke_rr(track, r, m.px(1).max(1), SEG_RIM_ALPHA);
-                    for (j, opt) in options(set).iter().enumerate() {
+                    for (j, opt) in opts.iter().enumerate() {
                         let id = item_id(i, Some(j));
                         let Some(rc) = self.hits.rect(id) else { continue };
                         let ty = center_y(&rc, lsm);
@@ -795,7 +818,7 @@ impl Content for SettingsPopup {
         let (i, part) = decode(id);
         match (self.items.get(i), part) {
             // The segment already selected does nothing.
-            (Some(Item::Choice(set, _)), Some(j)) => selected(&self.cfg, *set) != Some(j),
+            (Some(Item::Choice(set, _)), Some(j)) => selected(&self.cfg, *set, &self.screens) != Some(j),
             (Some(Item::Swatches), Some(k)) => k == BACKGROUND_PRESETS.len() || !swatch_selected(self.cfg.background, k),
             (Some(Item::ResetSizes), _) => !sizes_are_default(&self.cfg),
             _ => true,
@@ -805,8 +828,9 @@ impl Content for SettingsPopup {
     fn click(&mut self, id: u32) -> Reply {
         let (i, part) = decode(id);
         match (self.items.get(i).copied(), part) {
-            (Some(Item::Choice(set, _)), Some(j)) if selected(&self.cfg, set) != Some(j) => {
-                self.change(|c| choose(c, set, j), true)
+            (Some(Item::Choice(set, _)), Some(j)) if selected(&self.cfg, set, &self.screens) != Some(j) => {
+                let sc = self.screens.clone();
+                self.change(move |c| choose(c, set, j, &sc), true)
             }
             (Some(Item::Toggle(set, _)), None) => self.change(|c| flip(c, set), true),
             (Some(Item::Open(page, _)), None) => self.goto(page),
@@ -825,7 +849,7 @@ impl Content for SettingsPopup {
                     // Custom swatch: opens (from the current colour) or closes the picker.
                     self.picker_open = !self.picker_open;
                     self.hsv = rgb_to_hsv(self.cfg.background.rgb());
-                    self.items = items(&self.cfg, self.page, self.picker_open);
+                    self.items = items(&self.cfg, self.page, self.picker_open, &self.screens);
                     Reply::Relayout
                 }
             },
@@ -915,12 +939,40 @@ mod tests {
     #[test]
     fn choices_roundtrip() {
         let mut c = Config::default();
-        for set in [Setting::Position, Setting::Display] {
-            for j in 0..options(set).len() {
-                choose(&mut c, set, j);
-                assert_eq!(selected(&c, set), Some(j));
+        let sc = test_screens();
+        for set in [Setting::Position, Setting::Monitor, Setting::Display] {
+            for j in 0..options(set, &sc).len() {
+                choose(&mut c, set, j, &sc);
+                assert_eq!(selected(&c, set, &sc), Some(j));
             }
         }
+    }
+
+    fn test_screens() -> Vec<Screen> {
+        let d = |device: &str, label, primary| Screen { device: device.into(), label, primary };
+        vec![d("\\\\.\\DISPLAY1", "1", true), d("\\\\.\\DISPLAY2", "2", false), d("\\\\.\\DISPLAY3", "3", false)]
+    }
+
+    #[test]
+    fn screen_choice() {
+        let sc = test_screens();
+        assert_eq!(options(Setting::Monitor, &sc), ["Main", "2", "3"]);
+        let mut c = Config::default();
+        assert_eq!(selected(&c, Setting::Monitor, &sc), Some(0));
+        choose(&mut c, Setting::Monitor, 2, &sc);
+        assert_eq!(c.monitor, "\\\\.\\DISPLAY3");
+        // The primary is stored as "" (follow the primary monitor).
+        choose(&mut c, Setting::Monitor, 0, &sc);
+        assert!(c.monitor.is_empty());
+        // A chosen display that is not connected: the bar is on the primary, "Main" is shown.
+        c.monitor = "\\\\.\\DISPLAY9".into();
+        assert_eq!(selected(&c, Setting::Monitor, &sc), Some(0));
+        // One display: no screen row, the page is the same as before.
+        let one = &sc[..1];
+        let has = |s: &[Screen]| {
+            items(&c, Page::Main, false, s).iter().any(|i| matches!(i, Item::Choice(Setting::Monitor, _)))
+        };
+        assert!(!has(one) && has(&sc));
     }
 
     #[test]
@@ -937,7 +989,7 @@ mod tests {
             flip(&mut c, set);
             assert_eq!(is_on(&c, set), !was);
         }
-        assert!(!items(&c, Page::Main, false).iter().any(|i| matches!(i, Item::TrayChooser)));
+        assert!(!items(&c, Page::Main, false, &[]).iter().any(|i| matches!(i, Item::TrayChooser)));
     }
 
     #[test]
