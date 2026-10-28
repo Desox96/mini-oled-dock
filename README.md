@@ -2,6 +2,8 @@
 
 A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust with raw Win32 and no UI framework.
 
+> **About this fork.** The `mini-oled-dock-plus` branch is [gitgiovik/mini-oled-dock](https://github.com/gitgiovik/mini-oled-dock) with its open pull requests #1-#4 merged: Start button and quick-links menu (#1) and window previews (#2) by Desox, the multi-monitor screen choice (#3) and the AppBar position fix with clearer logs (#4). It is not an official release.
+
 ![The bar](docs/screenshots/bar_top_icon_text.png)
 
 It replaces the native taskbar with a small centred pill that hides when you do not need it. Backgrounds are pure black (OLED pixels switch off), only program names are shown in the bar (window titles appear only in the previews that open when you hover an app with several windows), tray icons of other apps are hosted in the bar, and the popups are drawn by hand. The executable is about 0.7 MB and uses roughly 10 MB of RAM (working set trimmed to under 1 MB while hidden); numbers from the author's machine.
@@ -51,7 +53,7 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 Requires Windows 11 and a stable Rust toolchain (1.87+, MSVC target).
 
 ```powershell
-git clone https://github.com/gitgiovik/mini-oled-dock
+git clone https://github.com/Ragnatela666/mini-oled-dock
 cd mini-oled-dock
 cargo build --release
 .\target\release\dock.exe
@@ -179,5 +181,7 @@ To render the screenshots, build with `DOCK_NO_MANIFEST=1` (a non-elevated manif
 ## Credits and license
 
 A few Windows shell protocol structures in `src/tray_host.rs` are adapted from [lightbar](https://github.com/SauerExe/lightbar) (MIT); see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Other shell projects were studied for protocol knowledge only; no AGPL code was copied.
+
+The Start button, quick-links menu and window previews are by Desox (PRs #1 and #2 upstream).
 
 [MIT](LICENSE) &copy; 2026 gitgiovik
