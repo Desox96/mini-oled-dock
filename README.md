@@ -59,7 +59,9 @@ New in this fork:
 
 ## Install
 
-Requires Windows 11 and a stable Rust toolchain (1.87+, MSVC target).
+**Download:** a ready-built `dock.exe` (with its SHA256) is attached to every [release](https://github.com/Ragnatela666/mini-oled-dock/releases/latest). Run `.\dock.exe --install` from the folder you downloaded it to (see below); to update, do the same with the newer exe. Releases are built and tested by GitHub Actions from the tagged source.
+
+**Build from source:** requires Windows 11 and a stable Rust toolchain (1.87+, MSVC target).
 
 ```powershell
 git clone https://github.com/Ragnatela666/mini-oled-dock
