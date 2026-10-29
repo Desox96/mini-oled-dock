@@ -305,11 +305,11 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             _ => dispatch_to_ui(h, m, wp, lp),
         },
         WM_DOCK_TOGGLE => {
-            ui::toggle();
+            ui::win_tap();
             LRESULT(0)
         }
         WM_DOCK_START_MENU => {
-            ui::open_start_menu();
+            ui::win_double_tap();
             LRESULT(0)
         }
         WM_DOCK_WINKEY => {

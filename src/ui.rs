@@ -593,6 +593,61 @@ pub fn toggle() {
     }
 }
 
+/// Lone Win tap (`WM_DOCK_TOGGLE`). With `config.win_opens_start` it opens / closes the Start menu
+/// together with the bar (`start_with_bar`), otherwise it shows / hides the bar (`toggle`).
+pub fn win_tap() {
+    if config::get().win_opens_start {
+        start_with_bar();
+    } else {
+        toggle();
+    }
+}
+
+/// Second quick Win tap (`WM_DOCK_START_MENU`). With `config.win_opens_start` every tap is the same
+/// toggle (`start_with_bar`), otherwise it opens the Start menu (`open_start_menu`).
+pub fn win_double_tap() {
+    if config::get().win_opens_start {
+        start_with_bar();
+    } else {
+        open_start_menu();
+    }
+}
+
+/// `win_opens_start`: the Start menu and the bar appear and disappear as ONE animation. A hidden bar
+/// is shown and the Start menu is linked to its slide+fade (`popup::link_to_bar`: same level, same
+/// frame, presented from `on_vis_tick`); with the Start menu open, the bar hides and the menu is linked
+/// to the hide animation, then closes on its last frame. A tap during that hide reverses both. With
+/// auto-hide off the bar stays and only the Start menu closes.
+fn start_with_bar() {
+    if popup::current() == Some(PopupKind::StartMenu) {
+        if !VISIBLE.load(Relaxed) && popup::is_linked() {
+            show_dock("Win (Start + bar, reversed)", SHOW_MS);
+        } else if VISIBLE.load(Relaxed) && config::effective_autohide() {
+            popup::link_to_bar();
+            hide_dock("Win (Start + bar)");
+        } else {
+            popup::close("Win (Start)");
+        }
+        return;
+    }
+    follow_pointer();
+    let was_visible = VISIBLE.load(Relaxed);
+    if !was_visible {
+        show_dock("Win (Start + bar)", SHOW_MS);
+    }
+    match anchor_for(ItemId::Start).or_else(bar_start_anchor) {
+        Some(a) => popup::toggle(PopupKind::StartMenu, a),
+        None => {
+            log!("start_with_bar: the bar has no geometry yet");
+            return;
+        }
+    }
+    if !was_visible && popup::current() == Some(PopupKind::StartMenu) && popup::link_to_bar() {
+        let (dy, alpha) = vis_offset(config_top());
+        popup::follow_bar(dy, alpha, false);
+    }
+}
+
 /// Win key tapped twice (`WM_DOCK_START_MENU`): opens (or closes) the dock's own Start menu
 /// (`popup_startmenu`: all apps, search, pins) on the bar, which in "pointer" mode is first brought
 /// to the display under the pointer. The first tap already toggled the bar, so it is shown again if
@@ -1110,6 +1165,10 @@ fn on_vis_tick(h: HWND) {
     if done {
         stop_vis_anim(a.to);
         if a.to <= 0.0 {
+            // A popup linked to the hide (Win with the Start menu open) goes away on the same frame.
+            if popup::is_linked() {
+                popup::close("bar hidden (with Start)");
+            }
             hide_window(h);
             return;
         }
@@ -1117,6 +1176,8 @@ fn on_vis_tick(h: HWND) {
     let Some(g) = GEOM.with(|g| g.get()) else { return };
     let (dy, alpha) = vis_offset(config_top());
     render::present_alpha(h, g.x, g.y + dy, alpha);
+    // Same level, same tick: a linked popup moves with the bar (released once the show settles).
+    popup::follow_bar(dy, alpha, done);
 }
 
 // ------------------------------------------------------------ attention (FlashWindowEx)
@@ -2770,7 +2831,10 @@ pub fn hide_dock(reason: &str) {
     // Hiding over a fullscreen app is instant; otherwise slide+fade out.
     let instant = FS_SHOWN.swap(false, Relaxed);
     let prev = if instant { FS_PREV.swap(0, Relaxed) } else { 0 };
-    crate::popup::close("dock hidden");
+    // A popup linked to the bar (`start_with_bar`) fades out with it and closes in `on_vis_tick`.
+    if instant || !crate::popup::is_linked() {
+        crate::popup::close("dock hidden");
+    }
     picker_cancel("dock hidden");
     if instant {
         stop_vis_anim(0.0);

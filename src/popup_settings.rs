@@ -85,6 +85,8 @@ enum Setting {
     Display,
     AutoHide,
     Previews,
+    /// `config.win_opens_start`: Win opens / closes the Start menu together with the bar.
+    WinStart,
     Seconds,
     /// `Config::module_visible` name.
     Module(&'static str),
@@ -141,6 +143,7 @@ fn items(c: &Config, page: Page, picker_open: bool, sc: &[Screen]) -> Vec<Item> 
                 Item::Section("Behavior"),
                 Item::Toggle(Setting::AutoHide, "Auto-hide"),
                 Item::Toggle(Setting::Previews, "Window previews"),
+                Item::Toggle(Setting::WinStart, "Win key opens Start"),
                 Item::Toggle(Setting::Seconds, "Clock seconds"),
                 Item::Section("Modules"),
                 // The Start button is a fixed item at the left end of the bar, not part of `MODULE_NAMES`.
@@ -243,6 +246,7 @@ fn is_on(c: &Config, s: Setting) -> bool {
     match s {
         Setting::AutoHide => c.autohide,
         Setting::Previews => c.window_previews,
+        Setting::WinStart => c.win_opens_start,
         Setting::Seconds => c.show_seconds,
         Setting::Module(n) => c.module_visible(n),
         _ => false,
@@ -253,6 +257,7 @@ fn flip(c: &mut Config, s: Setting) {
     match s {
         Setting::AutoHide => c.autohide = !c.autohide,
         Setting::Previews => c.window_previews = !c.window_previews,
+        Setting::WinStart => c.win_opens_start = !c.win_opens_start,
         Setting::Seconds => c.show_seconds = !c.show_seconds,
         Setting::Module(n) => {
             let on = c.module_visible(n);
@@ -1006,6 +1011,7 @@ mod tests {
         for set in [
             Setting::AutoHide,
             Setting::Previews,
+            Setting::WinStart,
             Setting::Seconds,
             Setting::Module("metrics"),
             Setting::Module("tray"),

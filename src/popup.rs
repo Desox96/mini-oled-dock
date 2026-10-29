@@ -347,6 +347,11 @@ struct Open {
     tracking: bool,
     fade_start: u64,
     alpha: u8,
+    /// true while the bar's show/hide animation drives this popup (`link_to_bar`): `alpha` and `dy`
+    /// come from `follow_bar`, the popup's own fade is off.
+    linked: bool,
+    /// Vertical offset (px) of the linked slide, added to `pos` when presenting; 0 otherwise.
+    dy: i32,
     /// Foreground window at open time (tick safety net).
     fg_at_open: HWND,
     /// true once the popup has been seen as the foreground window.
@@ -469,6 +474,55 @@ pub fn toggle(kind: PopupKind, anchor: Anchor) {
 /// Closes the open popup (no-op if none). `reason` is for the log only.
 pub fn close(reason: &str) {
     close_inner(reason);
+}
+
+/// Links the open popup to the bar's show/hide animation (Win with `win_opens_start`): its own fade
+/// stops and `follow_bar` sets its alpha and slide on the bar's frames. false if no popup is open.
+pub fn link_to_bar() -> bool {
+    let hwnd = with(|st| {
+        let o = st.open.as_mut()?;
+        o.linked = true;
+        Some(st.hwnd)
+    })
+    .flatten();
+    let Some(hwnd) = hwnd else { return false };
+    // SAFETY: timer of our window; fails harmlessly if it is not armed.
+    let _ = unsafe { KillTimer(Some(hwnd), TIMER_POPUP_ANIM) };
+    true
+}
+
+/// true if the open popup follows the bar's animation (`link_to_bar`).
+pub fn is_linked() -> bool {
+    STATE.with(|s| s.try_borrow().ok().and_then(|g| g.open.as_ref().map(|o| o.linked)).unwrap_or(false))
+}
+
+/// One frame of the bar's show/hide animation (`ui::on_vis_tick`): a linked popup is presented with
+/// the bar's slide `dy` and `alpha`, without repainting. `settled` with full alpha ends the link (the
+/// show is over). No-op when nothing is linked.
+pub fn follow_bar(dy: i32, alpha: u8, settled: bool) {
+    let prepared = with(|st| {
+        let hwnd = st.hwnd;
+        let o = st.open.as_mut()?;
+        if !o.linked {
+            return None;
+        }
+        o.dy = dy;
+        o.alpha = alpha;
+        if settled && alpha == 255 {
+            o.linked = false;
+            o.dy = 0;
+        }
+        let surf = o.surf.take()?;
+        Some((hwnd, surf, o.pos))
+    })
+    .flatten();
+    let Some((hwnd, surf, pos)) = prepared else { return };
+    surf.present(hwnd, pos.0, pos.1 + dy, alpha);
+    with(|st| {
+        if let Some(o) = st.open.as_mut() {
+            o.surf = Some(surf);
+        }
+    });
 }
 
 /// true if a popup is open (the UI suspends auto-hide).
@@ -792,6 +846,8 @@ fn open(kind: PopupKind, anchor: Anchor) {
             tracking: false,
             fade_start: now_ms(),
             alpha: 0,
+            linked: false,
+            dy: 0,
             fg_at_open: fg,
             was_active: false,
             wheel_acc: 0,
@@ -892,13 +948,13 @@ fn render(relayout: bool) -> bool {
             o.pos = compute_pos(&o.anchor, w.max(1), h.max(1));
         }
         o.content.paint(&mut surf, o.hot, o.pressed);
-        Some((hwnd, surf, o.pos, o.alpha))
+        Some((hwnd, surf, o.pos, o.alpha, o.dy))
     })
     .flatten();
-    let Some((hwnd, surf, pos, alpha)) = prepared else { return false };
+    let Some((hwnd, surf, pos, alpha, dy)) = prepared else { return false };
     let (sw, sh) = surf.size();
     store_rect(&POPUP_RECT, &RECT { left: pos.0, top: pos.1, right: pos.0 + sw, bottom: pos.1 + sh });
-    let ok = surf.present(hwnd, pos.0, pos.1, alpha);
+    let ok = surf.present(hwnd, pos.0, pos.1 + dy, alpha);
     with(|st| {
         if let Some(o) = st.open.as_mut() {
             o.surf = Some(surf);
@@ -1212,6 +1268,10 @@ fn on_set_cursor(hwnd: HWND) -> bool {
 fn on_anim(hwnd: HWND) {
     let done = with(|st| {
         let o = st.open.as_mut()?;
+        if o.linked {
+            // The bar's animation drives the alpha (`follow_bar`): the own fade stops here.
+            return Some(true);
+        }
         let el = now_ms().saturating_sub(o.fade_start);
         let a = ((el * 255) / FADE_MS).min(255) as u8;
         o.alpha = a;

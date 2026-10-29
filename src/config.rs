@@ -173,6 +173,10 @@ pub struct Config {
     /// Window picker with live DWM thumbnails when the pointer rests on an app with 2+ windows
     /// (`picker`). false = no hover timer is armed and no picker window is ever created.
     pub window_previews: bool,
+    /// Every Win tap opens / closes the Start menu together with the bar, as one show/hide
+    /// animation (`ui::start_with_bar`). false = the original behaviour: Win toggles the bar,
+    /// double tap = Start.
+    pub win_opens_start: bool,
     pub hide_native_taskbar: bool,
     pub pinned: Vec<PinnedApp>,
     /// Apps pinned at the top of the Start menu opened by the Win double tap (`popup_startmenu`),
@@ -267,6 +271,7 @@ impl Default for Config {
             monitor: String::new(),
             autohide: true,
             window_previews: true,
+            win_opens_start: false,
             hide_native_taskbar: true,
             pinned: Vec::new(),
             start_pins: Vec::new(),
@@ -504,6 +509,10 @@ fn render(c: &Config) -> String {
   // title); click a preview to switch to that window. false = no previews and no extra window.
   "window_previews": {window_previews},
 
+  // true = the Win key opens the Start menu together with the bar and the next tap closes both
+  // (one animation). false = the Win key shows / hides the bar and a double tap opens the Start menu.
+  "win_opens_start": {win_opens_start},
+
   // Hide Windows' own taskbar while the dock runs (restored when the dock exits).
   "hide_native_taskbar": {hide_native},
 
@@ -609,6 +618,7 @@ fn render(c: &Config) -> String {
         module_size = c.module_size,
         autohide = c.autohide,
         window_previews = c.window_previews,
+        win_opens_start = c.win_opens_start,
         hide_native = c.hide_native_taskbar,
         show_date = c.show_date,
         time_format = js(&c.time_format),
@@ -1038,8 +1048,10 @@ mod tests {
         c.background = Background(0x2E1119);
         c.bar_opacity = 0;
         c.window_previews = false;
+        c.win_opens_start = true;
         let r = render(&c);
         assert!(r.contains("\"window_previews\": false"));
+        assert!(r.contains("\"win_opens_start\": true"));
         assert!(r.contains("Get-StartApps") && r.contains("\"background\": \"#2E1119\""));
         assert!(!r.contains("\"bar_size\":"));
         assert_eq!(parse(&r).unwrap(), c);
