@@ -29,6 +29,49 @@ pub enum Language {
     It,
 }
 
+/// Layout of the dock's own Start menu (`popup_startmenu`). Written as "vertical" / "horizontal";
+/// an unknown value falls back to vertical instead of rejecting the whole file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StartStyle {
+    /// Search, two rows of pins and the alphabetical list in one column (the original menu).
+    #[default]
+    Vertical,
+    /// Windows 11 organization: pages of pinned tiles, "All apps" on its own page, user and power bar.
+    Horizontal,
+}
+
+impl StartStyle {
+    /// The config value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StartStyle::Vertical => "vertical",
+            StartStyle::Horizontal => "horizontal",
+        }
+    }
+
+    /// Parses the config value (any case); anything else is `Vertical`.
+    pub fn parse(s: &str) -> StartStyle {
+        if s.trim().eq_ignore_ascii_case("horizontal") {
+            StartStyle::Horizontal
+        } else {
+            StartStyle::Vertical
+        }
+    }
+}
+
+impl Serialize for StartStyle {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for StartStyle {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(StartStyle::parse(&s))
+    }
+}
+
 /// Position of the bar.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -353,6 +396,8 @@ pub struct Config {
     /// Apps pinned at the top of the Start menu opened by the Win double tap (`popup_startmenu`),
     /// in order: AppsFolder ids (`shell_thread::StartApp::id`). Separate from the bar's `pinned`.
     pub start_pins: Vec<String>,
+    /// Layout of that Start menu: "vertical" (default) or "horizontal" (`StartStyle`).
+    pub start_style: StartStyle,
     /// Name overrides: key = lowercase exe file name (e.g. "code.exe") or AUMID;
     /// value = name to show.
     pub names: BTreeMap<String, String>,
@@ -450,6 +495,7 @@ impl Default for Config {
             hide_native_taskbar: true,
             pinned: Vec::new(),
             start_pins: Vec::new(),
+            start_style: StartStyle::Vertical,
             names: BTreeMap::new(),
             show_date: true,
             show_volume_percent: true,
@@ -700,6 +746,11 @@ fn render(c: &Config) -> String {
   // (one animation). false = the Win key shows / hides the bar and a double tap opens the Start menu.
   "win_opens_start": {win_opens_start},
 
+  // Layout of the dock's Start menu: "vertical" (search, pinned apps and the list of all apps in one
+  // column) or "horizontal" (Windows 11 style: pages of pinned apps, "All apps" on its own page,
+  // user name and power button at the bottom). Normally chosen in Settings. Other values = "vertical".
+  "start_style": "{start_style}",
+
   // Hide Windows' own taskbar while the dock runs (restored when the dock exits).
   "hide_native_taskbar": {hide_native},
 
@@ -815,6 +866,7 @@ fn render(c: &Config) -> String {
         autohide = c.autohide,
         window_previews = c.window_previews,
         win_opens_start = c.win_opens_start,
+        start_style = c.start_style.as_str(),
         hide_native = c.hide_native_taskbar,
         show_date = c.show_date,
         time_format = js(&c.time_format),
@@ -1316,6 +1368,26 @@ mod tests {
         toggle_start_pin_in(&mut c, " ");
         assert_eq!(c.start_pins, vec!["{6D809377-6AF0-444B-8957-A3773F02200E}\\Git\\git-bash.exe".to_string()]);
         assert!(Config::default().start_pins.is_empty());
+    }
+
+    #[test]
+    fn start_style_roundtrip_and_fallback() {
+        assert_eq!(Config::default().start_style, StartStyle::Vertical);
+        let r = render(&Config::default());
+        assert!(r.contains("\"start_style\": \"vertical\""));
+        let mut c = Config::default();
+        c.start_style = StartStyle::Horizontal;
+        let r = render(&c);
+        assert!(r.contains("\"start_style\": \"horizontal\""));
+        assert_eq!(parse(&r).unwrap(), c);
+        assert_eq!(parse(&serde_json::to_string(&c).unwrap()).unwrap(), c);
+        // Any case is read; unknown values fall back to vertical without rejecting the file.
+        assert_eq!(parse("{\"start_style\": \"Horizontal\"}").unwrap().start_style, StartStyle::Horizontal);
+        let odd = parse("{\"start_style\": \"diagonal\", \"autohide\": false}").unwrap();
+        assert_eq!(odd.start_style, StartStyle::Vertical);
+        assert!(!odd.autohide);
+        // An old config without the key gets the original menu.
+        assert_eq!(parse("{}").unwrap().start_style, StartStyle::Vertical);
     }
 
     #[test]

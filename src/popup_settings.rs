@@ -1,6 +1,7 @@
-//! SETTINGS popup (from "Settings" in the power popup): the dock's own options on three short pages.
+//! SETTINGS popup (from "Settings" in the power popup): the dock's own options on four short pages.
 //!
-//!  * Main page. Appearance: position and display mode (segmented choices drawn by hand), then
+//!  * Main page. Appearance: language, Start menu style (vertical / horizontal, with a separate "›"
+//!    opening the Start menu page), position and display mode (segmented choices drawn by hand), then
 //!    "Background ›" and "Sizes ›" (sub-pages). Behavior: auto-hide, window previews, clock seconds (switches).
 //!    Modules: the Start button switch, one switch per system module (`config::MODULE_NAMES` mechanism)
 //!    and, with the tray on, "Choose tray icons" (switches to the tray popup in chooser mode).
@@ -8,6 +9,8 @@
 //!    a hand-drawn colour picker (saturation/value square, hue strip, preview and hex code), and the
 //!    background opacity slider (0-100 %).
 //!  * Sizes page: app icons, app names, tray icons and modules sliders, and "Reset sizes".
+//!  * Start menu page: "Import from Windows Start" (`start_import`), the row showing the import
+//!    status (importing, imported N apps, failed).
 //!
 //! Every change applies LIVE. Clicks, wheel steps and the end of a drag save through `config::modify`
 //! (the commented template survives); while a slider or the picker is being dragged the change is only
@@ -15,7 +18,8 @@
 //! (throttled while dragging) asks the dock window to rebuild the bar outside this popup's wnd_proc.
 //! If the file cannot be written the change still applies for this session.
 //! No timer, thread or system object: when the popup closes nothing of it keeps running (a drag still
-//! unsaved at that point is saved by `closing`).
+//! unsaved at that point is saved by `closing`). The only exception is the Start import, a one-shot
+//! thread of `start_import` that ends with its job; its result is read on the popup's 1 s tick.
 
 use std::sync::Arc;
 
@@ -23,13 +27,14 @@ use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::config::{
-    self, Background, Config, DisplayMode, Language, Position, SizeRange, APP_ICON_SIZE, APP_TEXT_SIZE, BACKGROUND_PRESETS,
+    self, Background, Config, DisplayMode, Language, Position, SizeRange, StartStyle, APP_ICON_SIZE, APP_TEXT_SIZE, BACKGROUND_PRESETS,
     MODULE_SIZE, TRAY_ICON_SIZE,
 };
 use crate::glyphs;
 use crate::i18n::tr;
 use crate::log;
 use crate::msg::WM_DOCK_CONFIG_APPLY;
+use crate::start_import;
 use crate::popup::{self, center_y, hline, lift, row_plate, tick_ms, toggle_switch, Content, HitMap, PopupKind, Reply};
 use crate::surface::{rect_wh, Font, Surface, PRESS_ALPHA, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, TEXT_COL, WHITE};
 use crate::ui::Screen;
@@ -51,6 +56,9 @@ const PICKER_GAP: i32 = 10;
 /// Segmented control: height, horizontal text padding of a segment (logical px).
 const SEG_H: i32 = 20;
 const SEG_PAD: i32 = 7;
+/// Choice row with a sub-page: width of the "›" hit area at the right end, gap before it (logical px).
+const ARROW_W: i32 = 22;
+const ARROW_GAP: i32 = 2;
 /// Segmented control alphas: track fill and outline, hovered segment.
 const SEG_TRACK_ALPHA: u32 = 14;
 const SEG_RIM_ALPHA: u32 = 40;
@@ -75,6 +83,8 @@ pub(crate) enum Page {
     Main,
     Background,
     Sizes,
+    /// Start menu options (the import from the Windows Start).
+    StartMenu,
 }
 
 /// A setting changed by a choice or a switch.
@@ -82,6 +92,8 @@ pub(crate) enum Page {
 enum Setting {
     /// `config.language`: System / English / Italiano.
     Language,
+    /// `config.start_style`: Vertical / Horizontal.
+    StartStyle,
     Position,
     /// Display the bar sits on (`config.monitor`); offered only with two or more displays.
     Monitor,
@@ -112,6 +124,8 @@ enum Item {
     ColourSection,
     /// Label + segmented choice.
     Choice(Setting, &'static str),
+    /// Label + segmented choice + a separate "›" (the part after the segments) opening a sub-page.
+    ChoiceMore(Setting, &'static str, Page),
     /// Label + switch (the whole row is clickable).
     Toggle(Setting, &'static str),
     /// "›" row opening a sub-page.
@@ -120,6 +134,8 @@ enum Item {
     Back(&'static str),
     /// "Choose tray icons" link.
     TrayChooser,
+    /// "Import from Windows Start": the label, or the status of the import (`start_import`).
+    ImportStart,
     /// Preset swatches + the custom swatch (opens / closes the picker).
     Swatches,
     /// Colour picker (only while open).
@@ -138,6 +154,7 @@ fn items(c: &Config, page: Page, picker_open: bool, sc: &[Screen]) -> Vec<Item> 
             let mut v = vec![
                 Item::Section(tr("Appearance", "Aspetto")),
                 Item::Choice(Setting::Language, tr("Language", "Lingua")),
+                Item::ChoiceMore(Setting::StartStyle, tr("Start menu", "Menu Start"), Page::StartMenu),
                 Item::Choice(Setting::Position, tr("Position", "Posizione")),
             ];
             if sc.len() > 1 {
@@ -178,6 +195,7 @@ fn items(c: &Config, page: Page, picker_open: bool, sc: &[Screen]) -> Vec<Item> 
             Item::Slider(Slider::Module, tr("Modules", "Moduli")),
             Item::ResetSizes,
         ],
+        Page::StartMenu => vec![Item::Back(tr("Start menu", "Menu Start")), Item::ImportStart],
     }
 }
 
@@ -201,6 +219,7 @@ fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
     match s {
         // Each language in its own name, so it can be found whatever the current one is.
         Setting::Language => vec![tr("System", "Sistema"), "English", "Italiano"],
+        Setting::StartStyle => vec![tr("Vertical", "Verticale"), tr("Horizontal", "Orizzontale")],
         Setting::Position => vec![tr("Top", "In alto"), tr("Bottom", "In basso")],
         Setting::Monitor => {
             // Last segment: follow the pointer (`config::MONITOR_POINTER`).
@@ -224,6 +243,7 @@ fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
             Language::En => 1,
             Language::It => 2,
         },
+        Setting::StartStyle => usize::from(c.start_style == StartStyle::Horizontal),
         Setting::Position => usize::from(c.position == Position::Bottom),
         Setting::Monitor => {
             if c.monitor.eq_ignore_ascii_case(config::MONITOR_POINTER) {
@@ -246,6 +266,7 @@ fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
 fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
     match s {
         Setting::Language => c.language = [Language::Auto, Language::En, Language::It][j.min(2)],
+        Setting::StartStyle => c.start_style = if j == 0 { StartStyle::Vertical } else { StartStyle::Horizontal },
         Setting::Position => c.position = if j == 0 { Position::Top } else { Position::Bottom },
         Setting::Monitor => {
             c.monitor = if j == sc.len() {
@@ -427,6 +448,26 @@ pub(crate) struct SettingsPopup {
     /// Time of the last `WM_DOCK_CONFIG_APPLY`, and a rebuild skipped by the throttle.
     last_apply: u64,
     apply_pending: bool,
+    /// Last `start_import::status_word` drawn (the tick redraws when the import reports back).
+    import_seen: u32,
+}
+
+/// Text of the import row for `st`.
+fn import_label(st: start_import::Status) -> String {
+    match st {
+        start_import::Status::Idle => tr("Import from Windows Start", "Importa dallo Start di Windows").to_string(),
+        start_import::Status::Running => tr("Importing\u{2026}", "Importazione\u{2026}").to_string(),
+        start_import::Status::Failed => tr("Import failed", "Importazione non riuscita").to_string(),
+        start_import::Status::Imported(n) => {
+            if crate::i18n::italian() {
+                format!("Importate {n} app")
+            } else if n == 1 {
+                "Imported 1 app".to_string()
+            } else {
+                format!("Imported {n} apps")
+            }
+        }
+    }
 }
 
 /// Creates the content from the current config, on the main page.
@@ -475,6 +516,8 @@ impl SettingsPopup {
         let cfg = config::get();
         let picker_open = page == Page::Background && preset_index(cfg.background).is_none();
         let screens = crate::ui::screens();
+        // A finished import's result belongs to the popup that started it.
+        start_import::reset();
         SettingsPopup {
             items: items(&cfg, page, picker_open, &screens),
             screens,
@@ -492,6 +535,7 @@ impl SettingsPopup {
             unsaved: false,
             last_apply: 0,
             apply_pending: false,
+            import_seen: start_import::status_word(),
         }
     }
 
@@ -694,15 +738,22 @@ impl Content for SettingsPopup {
             let rc = rect_wh(inset, y, self.width - 2 * inset, h);
             match *it {
                 Item::Section(_) | Item::ColourSection => {}
-                Item::Choice(set, _) => {
-                    // Segments right-aligned on the switches' right edge.
+                Item::Choice(set, _) | Item::ChoiceMore(set, _, _) => {
+                    let more = matches!(it, Item::ChoiceMore(..));
+                    // Segments right-aligned on the switches' right edge, or before the "›" of a
+                    // row with a sub-page (its own hit area, the part after the segments).
                     let ws = self.seg_widths(s, set);
                     let sh = m.px(SEG_H);
-                    let mut x = rc.right - m.px(12) - ws.iter().sum::<i32>();
+                    let end = if more { rc.right - m.px(ARROW_W) - m.px(ARROW_GAP) } else { rc.right - m.px(12) };
+                    let mut x = end - ws.iter().sum::<i32>();
                     let sy = y + (h - sh) / 2;
                     for (j, w) in ws.iter().enumerate() {
                         self.hits.add(item_id(i, Some(j)), rect_wh(x, sy, *w, sh));
                         x += w;
+                    }
+                    if more {
+                        let aw = m.px(ARROW_W);
+                        self.hits.add(item_id(i, Some(ws.len())), rect_wh(rc.right - aw, y, aw, h));
                     }
                 }
                 Item::Swatches => {
@@ -733,7 +784,12 @@ impl Content for SettingsPopup {
                     let band = RECT { left: col, top: cy - m.px(10), right: self.width - col, bottom: cy + m.px(10) };
                     self.hits.add(item_id(i, Some(0)), band);
                 }
-                Item::Toggle(..) | Item::Open(..) | Item::Back(_) | Item::TrayChooser | Item::ResetSizes => {
+                Item::Toggle(..)
+                | Item::Open(..)
+                | Item::Back(_)
+                | Item::TrayChooser
+                | Item::ImportStart
+                | Item::ResetSizes => {
                     self.hits.add(item_id(i, None), rc)
                 }
             }
@@ -772,11 +828,21 @@ impl Content for SettingsPopup {
                     let nw = s.text_width(&name, Font::Small);
                     s.text(&name, self.width - col - nw, ty, Font::Small, WHITE, TEXT2_ALPHA);
                 }
-                Item::Choice(set, label) => {
+                Item::Choice(set, label) | Item::ChoiceMore(set, label, _) => {
                     s.text(label, col, center_y(&row, ln), Font::Normal, WHITE, TEXT_ALPHA);
                     let sel = selected(&self.cfg, set, &self.screens);
                     let opts = options(set, &self.screens);
                     let n = opts.len();
+                    if matches!(it, Item::ChoiceMore(..)) {
+                        // The "›" to the sub-page, with its own hover plate.
+                        let id = item_id(i, Some(n));
+                        if let Some(rc) = self.hits.rect(id) {
+                            let lit = row_plate(s, rc, id, hot, pressed);
+                            let cw = s.text_width("\u{203A}", Font::Normal);
+                            let ty = center_y(&rc, ln);
+                            s.text("\u{203A}", rc.left + (rc.right - rc.left - cw) / 2, ty, Font::Normal, WHITE, lift(TEXT2_ALPHA, lit));
+                        }
+                    }
                     let (Some(first), Some(last)) =
                         (self.hits.rect(item_id(i, Some(0))), self.hits.rect(item_id(i, Some(n - 1))))
                     else {
@@ -845,6 +911,18 @@ impl Content for SettingsPopup {
                     let cw = s.text_width("\u{203A}", Font::Normal);
                     chevron(s, &row, "\u{203A}", row.right - m.px(12) - cw, lit);
                 }
+                Item::ImportStart => {
+                    let st = start_import::status();
+                    let busy = st == start_import::Status::Running;
+                    let lit = !busy && row_plate(s, row, item_id(i, None), hot, pressed);
+                    let a = match st {
+                        start_import::Status::Idle => lift(TEXT_ALPHA, lit),
+                        start_import::Status::Running => TEXT3_ALPHA,
+                        _ => lift(TEXT2_ALPHA, lit),
+                    };
+                    let text = s.ellipsize(&import_label(st), Font::Normal, row.right - row.left - m.px(24));
+                    s.text(&text, row.left + m.px(12), center_y(&row, ln), Font::Normal, WHITE, a);
+                }
                 Item::Swatches => self.paint_swatches(s, i, hot),
                 Item::Picker => self.paint_picker(s),
                 Item::Slider(sl, label) => {
@@ -870,8 +948,13 @@ impl Content for SettingsPopup {
         match (self.items.get(i), part) {
             // The segment already selected does nothing.
             (Some(Item::Choice(set, _)), Some(j)) => selected(&self.cfg, *set, &self.screens) != Some(j),
+            // The segment already selected does nothing; the part after the segments is the "›".
+            (Some(Item::ChoiceMore(set, _, _)), Some(j)) => {
+                j == options(*set, &self.screens).len() || selected(&self.cfg, *set, &self.screens) != Some(j)
+            }
             (Some(Item::Swatches), Some(k)) => k == BACKGROUND_PRESETS.len() || !swatch_selected(self.cfg.background, k),
             (Some(Item::ResetSizes), _) => !sizes_are_default(&self.cfg),
+            (Some(Item::ImportStart), _) => start_import::status() != start_import::Status::Running,
             _ => true,
         }
     }
@@ -882,6 +965,16 @@ impl Content for SettingsPopup {
             (Some(Item::Choice(set, _)), Some(j)) if selected(&self.cfg, set, &self.screens) != Some(j) => {
                 let sc = self.screens.clone();
                 self.change(move |c| choose(c, set, j, &sc), true)
+            }
+            (Some(Item::ChoiceMore(set, _, page)), Some(j)) => {
+                if j == options(set, &self.screens).len() {
+                    self.goto(page)
+                } else if selected(&self.cfg, set, &self.screens) != Some(j) {
+                    let sc = self.screens.clone();
+                    self.change(move |c| choose(c, set, j, &sc), true)
+                } else {
+                    Reply::None
+                }
             }
             (Some(Item::Toggle(set, _)), None) => self.change(|c| flip(c, set), true),
             (Some(Item::Open(page, _)), None) => self.goto(page),
@@ -905,6 +998,13 @@ impl Content for SettingsPopup {
                 }
             },
             (Some(Item::ResetSizes), None) if !sizes_are_default(&self.cfg) => self.change(reset_sizes, true),
+            (Some(Item::ImportStart), None) => {
+                if !start_import::start() {
+                    return Reply::None;
+                }
+                self.import_seen = start_import::status_word();
+                Reply::Redraw
+            }
             _ => Reply::None,
         }
     }
@@ -944,6 +1044,11 @@ impl Content for SettingsPopup {
             self.apply_pending = false;
             self.last_apply = tick_ms();
             post_apply();
+        }
+        let st = start_import::status_word();
+        if st != self.import_seen {
+            self.import_seen = st;
+            return Reply::Redraw;
         }
         Reply::None
     }
@@ -991,7 +1096,7 @@ mod tests {
     fn choices_roundtrip() {
         let mut c = Config::default();
         let sc = test_screens();
-        for set in [Setting::Language, Setting::Position, Setting::Monitor, Setting::Display] {
+        for set in [Setting::Language, Setting::StartStyle, Setting::Position, Setting::Monitor, Setting::Display] {
             for j in 0..options(set, &sc).len() {
                 choose(&mut c, set, j, &sc);
                 assert_eq!(selected(&c, set, &sc), Some(j));
@@ -1063,6 +1168,65 @@ mod tests {
         assert!(!sizes_are_default(&c));
         reset_sizes(&mut c);
         assert!(sizes_are_default(&c));
+    }
+
+    #[test]
+    fn start_style_row_fits_in_both_languages() {
+        let m = crate::render::Metrics { dpi: 96 };
+        let s = Surface::new(m).expect("surface");
+        for (label, opts) in [("Start menu", ["Vertical", "Horizontal"]), ("Menu Start", ["Verticale", "Orizzontale"])] {
+            let segs: i32 = opts.iter().map(|o| (s.text_width(o, Font::Small) + 2 * m.px(SEG_PAD)).max(m.px(30))).sum();
+            // Segments end before the "›" of the Start menu page.
+            let seg_left = m.px(WIDTH) - m.px(8) - m.px(ARROW_W) - m.px(ARROW_GAP) - segs;
+            assert!(m.px(TEXT_COL) + s.text_width(label, Font::Normal) + m.px(6) <= seg_left, "{label} overlaps its choice");
+        }
+        for st in [start_import::Status::Idle, start_import::Status::Running, start_import::Status::Failed, start_import::Status::Imported(3)] {
+            assert!(!import_label(st).is_empty());
+        }
+        assert_eq!(import_label(start_import::Status::Imported(1)), "Imported 1 app");
+    }
+
+    #[test]
+    fn start_menu_import_lives_on_its_own_page() {
+        let c = Config::default();
+        let main = items(&c, Page::Main, false, &[]);
+        // No import row on the main page: the Start menu choice opens the page instead.
+        assert!(!main.iter().any(|i| matches!(i, Item::ImportStart)));
+        let k = main
+            .iter()
+            .position(|i| matches!(i, Item::ChoiceMore(Setting::StartStyle, _, Page::StartMenu)))
+            .expect("Start menu row");
+        assert!(matches!(main[k - 1], Item::Choice(Setting::Language, _)));
+        assert!(matches!(main[k + 1], Item::Choice(Setting::Position, _)));
+        let page = items(&c, Page::StartMenu, false, &[]);
+        assert!(matches!(page.as_slice(), [Item::Back(_), Item::ImportStart]));
+    }
+
+    #[test]
+    fn start_menu_row_has_segments_and_a_separate_arrow() {
+        let m = crate::render::Metrics { dpi: 96 };
+        let s = Surface::new(m).expect("surface");
+        let mut p = SettingsPopup::at(Page::Main);
+        p.screens = Vec::new();
+        p.items = items(&p.cfg, Page::Main, false, &p.screens);
+        let (w, _) = p.size(&s);
+        let i = p.items.iter().position(|it| matches!(it, Item::ChoiceMore(..))).unwrap();
+        let n = options(Setting::StartStyle, &[]).len();
+        let last = p.hits.rect(item_id(i, Some(n - 1))).unwrap();
+        let arrow = p.hits.rect(item_id(i, Some(n))).unwrap();
+        // The arrow is right of the segments, apart from them, inside the popup.
+        assert!(arrow.left >= last.right && arrow.right <= w);
+        let (y, h) = p.rows[i];
+        assert!(arrow.top >= y && arrow.bottom <= y + h);
+        // Clicking the segments still chooses; the arrow opens the page, Back returns.
+        assert!(p.clickable(item_id(i, Some(n))));
+        assert_eq!(p.hits.at(arrow.left + 1, arrow.top + 1), Some(item_id(i, Some(n))));
+        assert_eq!(p.click(item_id(i, Some(n))), Reply::Relayout);
+        assert_eq!(p.page, Page::StartMenu);
+        assert!(matches!(p.items.as_slice(), [Item::Back(_), Item::ImportStart]));
+        p.size(&s);
+        assert_eq!(p.click(item_id(0, None)), Reply::Relayout);
+        assert_eq!(p.page, Page::Main);
     }
 
     #[test]

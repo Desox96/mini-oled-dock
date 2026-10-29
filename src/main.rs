@@ -60,6 +60,7 @@ mod power;
 mod preview;
 mod render;
 mod shell_thread;
+mod start_import;
 mod surface;
 mod taskbar;
 mod tray_host;

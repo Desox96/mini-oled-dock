@@ -1030,7 +1030,8 @@ fn build_start_index() -> HashMap<String, String> {
     map
 }
 
-fn expand_env(s: &str) -> String {
+/// `%NAME%` variables of the process environment expanded; unknown ones are kept as written.
+pub(crate) fn expand_env(s: &str) -> String {
     let mut out = String::new();
     let mut parts = s.split('%');
     out.push_str(parts.next().unwrap_or(""));
@@ -1139,8 +1140,9 @@ fn keep_start_app(id: &str, name: &str) -> bool {
 
 /// Every app of `shell:AppsFolder` (desktop shortcuts of the Start Menu folders AND packaged Store
 /// apps, the same catalog as the native Start menu): `IShellItem::BindToHandler(BHID_EnumItems)`.
-/// Duplicate ids are dropped. Empty on any failure (logged).
-fn enum_apps_folder() -> Vec<StartApp> {
+/// Duplicate ids are dropped. Empty on any failure (logged). Needs COM on the calling thread (the
+/// shell thread, or the short-lived import job of `start_import`).
+pub(crate) fn enum_apps_folder() -> Vec<StartApp> {
     let path = HSTRING::from("shell:AppsFolder");
     // SAFETY: COM STA initialized on the shell thread; `path` lives for the call.
     let folder: IShellItem = match unsafe { SHCreateItemFromParsingName(&path, None::<&IBindCtx>) } {
