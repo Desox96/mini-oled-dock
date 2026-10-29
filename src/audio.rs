@@ -12,7 +12,7 @@
 use windows::core::{
     implement, interface, IUnknown, IUnknown_Vtbl, Interface, Result as WinResult, GUID, HRESULT, HSTRING, PCWSTR,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use windows::Media::Audio::{
     SetDefaultSpatialAudioFormatStatus, SpatialAudioDeviceConfiguration, SpatialAudioFormatSubtype,
@@ -119,17 +119,49 @@ pub struct OutputDevice {
     pub kind: DeviceKind,
 }
 
-/// true while the audio popup is open. Written by the popup (UI thread), read by the shell thread
-/// to decide whether a device change or a finished spatial-format change must push fresh spatial
-/// and mixer data (nothing is read while the popup is closed).
-static POPUP_OPEN: AtomicBool = AtomicBool::new(false);
+/// Audio popup state for the shell thread, one byte: `POPUP_OPEN_BIT` while the popup is open, plus
+/// one `WANT_*` bit per section that is currently shown expanded (`popup_audio`, from
+/// `config::AudioLayout::loadable`). Written by the popup (UI thread), read by the shell thread to
+/// decide whether a device change or a finished spatial-format change must push fresh data: a
+/// collapsed or hidden section is never re-read, nothing is read while the popup is closed.
+static POPUP: AtomicU8 = AtomicU8::new(0);
+const POPUP_OPEN_BIT: u8 = 1;
+const WANT_OUTPUTS: u8 = 2;
+const WANT_SPATIAL: u8 = 4;
+const WANT_SESSIONS: u8 = 8;
 
+/// Popup opened / closed. Closing also drops every `WANT_*` bit.
 pub fn set_popup_open(open: bool) {
-    POPUP_OPEN.store(open, Ordering::Relaxed);
+    POPUP.store(if open { POPUP_OPEN_BIT } else { 0 }, Ordering::Relaxed);
 }
 
-pub fn popup_open() -> bool {
-    POPUP_OPEN.load(Ordering::Relaxed)
+/// Which sections of the open popup show their data (ignored while the popup is closed).
+pub fn set_popup_wants(outputs: bool, spatial: bool, sessions: bool) {
+    let bits = u8::from(outputs) * WANT_OUTPUTS | u8::from(spatial) * WANT_SPATIAL | u8::from(sessions) * WANT_SESSIONS;
+    // Only the UI thread writes this byte: a plain load + store is enough.
+    if POPUP.load(Ordering::Relaxed) & POPUP_OPEN_BIT != 0 {
+        POPUP.store(POPUP_OPEN_BIT | bits, Ordering::Relaxed);
+    }
+}
+
+fn popup_wants(bit: u8) -> bool {
+    let v = POPUP.load(Ordering::Relaxed);
+    v & POPUP_OPEN_BIT != 0 && v & bit != 0
+}
+
+/// The open popup shows the output devices.
+pub fn popup_wants_outputs() -> bool {
+    popup_wants(WANT_OUTPUTS)
+}
+
+/// The open popup shows the spatial sound formats.
+pub fn popup_wants_spatial() -> bool {
+    popup_wants(WANT_SPATIAL)
+}
+
+/// The open popup shows the volume mixer.
+pub fn popup_wants_sessions() -> bool {
+    popup_wants(WANT_SESSIONS)
 }
 
 // ------------------------------------------------- spatial sound (Windows.Media.Audio, WinRT)

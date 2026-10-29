@@ -394,7 +394,7 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
             WM_TIMER if msg.hwnd.0.is_null() => {}
             WM_SHELL_AUDIO_DEVICE_CHANGED => shell.on_audio_device_changed(),
             WM_SHELL_SPATIAL_CHANGED => {
-                if audio::popup_open() {
+                if audio::popup_wants_spatial() {
                     shell.push_spatial();
                 }
             }
@@ -447,12 +447,17 @@ impl Shell {
         self.ensure_audio();
         let st = self.audio.as_mut().map(|a| a.reopen_endpoint());
         self.publish_volume(st);
-        let list = self.audio.as_ref().map(|a| a.list_outputs()).unwrap_or_default();
-        push_event(self.ui, ShellEvent::AudioOutputs(list));
-        // The spatial formats and the sessions belong to the default device: re-read them, but
-        // only while the audio popup shows them.
-        if audio::popup_open() {
+        // The device list, the spatial formats and the sessions belong to the default device:
+        // re-read each one only while the audio popup shows it (open popup, section expanded and
+        // visible: `audio::set_popup_wants`). A collapsed section enumerates nothing.
+        if audio::popup_wants_outputs() {
+            let list = self.audio.as_ref().map(|a| a.list_outputs()).unwrap_or_default();
+            push_event(self.ui, ShellEvent::AudioOutputs(list));
+        }
+        if audio::popup_wants_spatial() {
             self.push_spatial();
+        }
+        if audio::popup_wants_sessions() {
             self.push_sessions();
         }
     }

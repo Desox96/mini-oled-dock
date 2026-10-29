@@ -130,6 +130,164 @@ pub const BACKGROUND_PRESETS: [(&str, Background); 7] = [
     ("Forest", Background(0x10261B)),
 ];
 
+// ------------------------------------------------------------- audio popup layout
+
+/// Sections of the audio popup (`popup_audio`), as stored in `AudioLayout`: master volume.
+pub const AUDIO_MASTER: u8 = 0;
+/// Output devices.
+pub const AUDIO_OUTPUT: u8 = 1;
+/// Spatial sound formats.
+pub const AUDIO_SPATIAL: u8 = 2;
+/// Per-app volume mixer.
+pub const AUDIO_MIXER: u8 = 3;
+/// Number of sections.
+const AUDIO_SECTIONS: u8 = 4;
+/// Letter of each section in the config string (index = section).
+const AUDIO_LETTERS: [char; 4] = ['m', 'o', 's', 'x'];
+
+/// Layout of the audio popup: order, expanded / collapsed and hidden sections. 6 bytes in memory,
+/// a short string in the file (`encode` / `parse`): one letter per section in display order
+/// (M master, O output, S spatial, X mixer), upper case = expanded, lower case = collapsed, a
+/// leading `-` = hidden. Default `"MOSX"`.
+///
+/// Invariant (kept by every method): `order` holds each section exactly once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioLayout {
+    /// Display order of the sections.
+    order: [u8; 4],
+    /// Bit `section` set = expanded.
+    open: u8,
+    /// Bit `section` set = hidden.
+    hidden: u8,
+}
+
+impl Default for AudioLayout {
+    /// The original popup: all four sections visible and expanded.
+    fn default() -> Self {
+        AudioLayout { order: [AUDIO_MASTER, AUDIO_OUTPUT, AUDIO_SPATIAL, AUDIO_MIXER], open: 0x0F, hidden: 0 }
+    }
+}
+
+impl AudioLayout {
+    /// Sections in display order.
+    pub fn order(&self) -> &[u8] {
+        &self.order
+    }
+
+    /// Section expanded.
+    pub fn is_open(&self, section: u8) -> bool {
+        section < AUDIO_SECTIONS && self.open & (1 << section) != 0
+    }
+
+    pub fn is_hidden(&self, section: u8) -> bool {
+        section < AUDIO_SECTIONS && self.hidden & (1 << section) != 0
+    }
+
+    /// Expands / collapses a section.
+    pub fn toggle_open(&mut self, section: u8) {
+        if section < AUDIO_SECTIONS {
+            self.open ^= 1 << section;
+        }
+    }
+
+    /// Shows / hides a section.
+    pub fn toggle_hidden(&mut self, section: u8) {
+        if section < AUDIO_SECTIONS {
+            self.hidden ^= 1 << section;
+        }
+    }
+
+    /// true if `section` is on screen with its content: visible and expanded. Only then does the
+    /// popup read its data from Windows.
+    pub fn loadable(&self, section: u8) -> bool {
+        section < AUDIO_SECTIONS && !self.is_hidden(section) && self.is_open(section)
+    }
+
+    /// Moves `section` so that it ends up at position `index` of the order (clamped to the last
+    /// one); the others keep their relative order. false if nothing changed.
+    pub fn move_to(&mut self, section: u8, index: usize) -> bool {
+        let Some(from) = self.order.iter().position(|&v| v == section) else { return false };
+        let to = index.min(self.order.len() - 1);
+        if from == to {
+            return false;
+        }
+        if from < to {
+            self.order[from..=to].rotate_left(1);
+        } else {
+            self.order[to..=from].rotate_right(1);
+        }
+        true
+    }
+
+    /// The config string (see the type doc), e.g. `"MOSX"` or `"M-oSX"`.
+    pub fn encode(&self) -> String {
+        let mut out = String::with_capacity(8);
+        for &s in &self.order {
+            if self.is_hidden(s) {
+                out.push('-');
+            }
+            let c = AUDIO_LETTERS[s as usize];
+            out.push(if self.is_open(s) { c.to_ascii_uppercase() } else { c });
+        }
+        out
+    }
+
+    /// Parses the config string. Tolerant: unknown characters and repeated sections are ignored,
+    /// missing sections come back at the end, visible and expanded. Never fails. A string saved by
+    /// an older version with the "More" group (`G(...)` / `g(...)`) is flattened: the grouped
+    /// sections take the group's place, with their own flags (the group's flag is dropped).
+    pub fn parse(text: &str) -> AudioLayout {
+        let mut l = AudioLayout { order: [0; 4], open: 0, hidden: 0 };
+        let mut n = 0;
+        let mut seen = 0u8;
+        let mut hide = false;
+        for c in text.chars() {
+            match c {
+                '-' => hide = true,
+                // Old group syntax: the marker and its brackets are dropped, a stray '-' with them.
+                'g' | 'G' | '(' | ')' => hide = false,
+                _ => {
+                    let Some(s) = AUDIO_LETTERS.iter().position(|&x| x == c.to_ascii_lowercase()) else { continue };
+                    let s = s as u8;
+                    if seen & (1 << s) == 0 {
+                        seen |= 1 << s;
+                        if c.is_ascii_uppercase() {
+                            l.open |= 1 << s;
+                        }
+                        if hide {
+                            l.hidden |= 1 << s;
+                        }
+                        l.order[n] = s;
+                        n += 1;
+                    }
+                    hide = false;
+                }
+            }
+        }
+        for s in 0..AUDIO_SECTIONS {
+            if seen & (1 << s) == 0 {
+                l.open |= 1 << s;
+                l.order[n] = s;
+                n += 1;
+            }
+        }
+        l
+    }
+}
+
+impl Serialize for AudioLayout {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.encode())
+    }
+}
+
+impl<'de> Deserialize<'de> for AudioLayout {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(AudioLayout::parse(&s))
+    }
+}
+
 /// Range of a size setting: `min..=max`; `default` reproduces the original look.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SizeRange {
@@ -254,6 +412,9 @@ pub struct Config {
     /// "show_desktop", "power". Validated on use (`render::modules_from_names`): unknown names are
     /// ignored, a missing module goes back next to its default neighbour.
     pub modules_order: Vec<String>,
+    /// Layout of the volume popup (`AudioLayout`): section order, expanded / collapsed and hidden.
+    /// Written as a short string, e.g. "MOSX" (the default).
+    pub audio_layout: AudioLayout,
     /// true once the `notif` thread has already asked for notification access once
     /// (`RequestAccessAsync`): the prompt is not shown again on every start.
     pub notif_prompted: bool,
@@ -316,6 +477,7 @@ impl Default for Config {
             app_order: Vec::new(),
             tray_order: Vec::new(),
             modules_order: DEFAULT_MODULES_ORDER.iter().map(|s| s.to_string()).collect(),
+            audio_layout: AudioLayout::default(),
             notif_prompted: false,
         }
     }
@@ -627,6 +789,15 @@ fn render(c: &Config) -> String {
   // Hiding a module (the show_* switches above) keeps its place in this list.
   "modules_order": {modules_order},
 
+  // Volume panel layout. Normally changed in the panel itself: click a section title to expand or
+  // collapse it, or use the pencil button at the bottom (Customize) to drag sections into a new
+  // order and to hide them. One letter per section, in display order: M = master volume,
+  // O = output devices, S = spatial sound, X = volume mixer. Upper case = expanded, lower case =
+  // collapsed, a leading "-" hides the section. Missing sections come back at the end.
+  // Example: "M-OsX". Default: "MOSX".
+  // A collapsed or hidden section reads nothing from Windows.
+  "audio_layout": {audio_layout},
+
   // Display-name overrides. Key = exe file name lowercase (e.g. "code.exe") or AUMID;
   // value = the name to show. Example: {{ "code.exe": "VS Code" }}
   "names": {names},
@@ -662,6 +833,7 @@ fn render(c: &Config) -> String {
         tray_order = js_block(&c.tray_order),
         app_order = js_block(&c.app_order),
         modules_order = js_block(&c.modules_order),
+        audio_layout = js(&c.audio_layout.encode()),
         tray_guids = js_block(&c.tray_hidden_guids),
         pinned = js_block(&c.pinned),
         start_pins = js_block(&c.start_pins),
@@ -1189,6 +1361,83 @@ mod tests {
         assert_eq!(parse("{\"bar_size\": \"large\", \"app_icon_size\": 30}").unwrap().sizes(), (30, 13, 16, 100));
         // Out-of-range values are clamped on use.
         assert_eq!(parse("{\"app_icon_size\": 200, \"module_size\": 5}").unwrap().sizes(), (32, 13, 16, 75));
+    }
+
+    #[test]
+    fn audio_layout_default_and_serialization() {
+        // Default: the original popup, written as "MOSX"; an old config without the key gets it.
+        let d = AudioLayout::default();
+        assert_eq!(d.encode(), "MOSX");
+        assert_eq!(d.order(), &[AUDIO_MASTER, AUDIO_OUTPUT, AUDIO_SPATIAL, AUDIO_MIXER]);
+        assert!((0..4).all(|s| d.is_open(s) && !d.is_hidden(s) && d.loadable(s)));
+        assert_eq!(parse("{\"show_tray\": false}").unwrap().audio_layout, d);
+        assert_eq!(AudioLayout::parse(""), d);
+        assert_eq!(AudioLayout::parse("MOSX"), d);
+        assert_eq!(std::mem::size_of::<AudioLayout>(), 6);
+        // Collapsed and hidden sections round-trip through the template.
+        let mut c = Config::default();
+        c.audio_layout = AudioLayout::parse("M-oXS");
+        assert_eq!(c.audio_layout.encode(), "M-oXS");
+        assert!(c.audio_layout.is_hidden(AUDIO_OUTPUT) && !c.audio_layout.is_open(AUDIO_OUTPUT));
+        let r = render(&c);
+        assert!(r.contains("\"audio_layout\": \"M-oXS\""));
+        assert_eq!(parse(&r).unwrap(), c);
+        // Tolerant parse: junk and repeats ignored, missing sections appended.
+        assert_eq!(AudioLayout::parse("x, m ?? X").encode(), "xmOS");
+        assert_eq!(AudioLayout::parse("so").encode(), "soMX");
+        // A value of the wrong type still rejects the file like any other field.
+        assert!(parse("{\"audio_layout\": 5}").is_err());
+    }
+
+    #[test]
+    fn audio_layout_old_group_strings_are_flattened() {
+        // The grouped sections take the group's place with their own flags; the group's own flag
+        // (G expanded / g collapsed) is ignored.
+        assert_eq!(AudioLayout::parse("M-oG(sX)").encode(), "M-osX");
+        assert_eq!(AudioLayout::parse("Og(-xM)S").encode(), "O-xMS");
+        assert_eq!(AudioLayout::parse("g(m)OSX").encode(), "mOSX");
+        assert_eq!(AudioLayout::parse("G()so").encode(), "soMX");
+        assert_eq!(AudioLayout::parse("gG(m)O").encode(), "mOSX");
+        // A stray '-' before the group marker hides nothing.
+        assert_eq!(AudioLayout::parse("-G(s)MOX").encode(), "sMOX");
+        // Old configs load through the file parser too.
+        let c = parse("{\"audio_layout\": \"G(Xs)Mo\"}").unwrap();
+        assert_eq!(c.audio_layout.order(), &[AUDIO_MIXER, AUDIO_SPATIAL, AUDIO_MASTER, AUDIO_OUTPUT]);
+        assert!(c.audio_layout.loadable(AUDIO_MIXER) && !c.audio_layout.loadable(AUDIO_SPATIAL));
+    }
+
+    #[test]
+    fn audio_layout_move_to() {
+        let mut l = AudioLayout::default();
+        assert!(!l.move_to(AUDIO_MASTER, 0));
+        assert!(!l.move_to(9, 0));
+        assert!(l.move_to(AUDIO_MASTER, 2));
+        assert_eq!(l.encode(), "OSMX");
+        assert!(l.move_to(AUDIO_MIXER, 0));
+        assert_eq!(l.encode(), "XOSM");
+        // Past the end = last.
+        assert!(l.move_to(AUDIO_OUTPUT, 99));
+        assert_eq!(l.encode(), "XSMO");
+        assert!(!l.move_to(AUDIO_OUTPUT, 3));
+        // Flags travel with the section.
+        l.toggle_hidden(AUDIO_SPATIAL);
+        l.toggle_open(AUDIO_SPATIAL);
+        assert!(l.move_to(AUDIO_SPATIAL, 3));
+        assert_eq!(l.encode(), "XMO-s");
+        assert_eq!(AudioLayout::parse(&l.encode()), l);
+    }
+
+    #[test]
+    fn audio_layout_loadable() {
+        let mut l = AudioLayout::default();
+        l.toggle_open(AUDIO_OUTPUT);
+        assert!(!l.loadable(AUDIO_OUTPUT));
+        l.toggle_open(AUDIO_OUTPUT);
+        l.toggle_hidden(AUDIO_OUTPUT);
+        assert!(!l.loadable(AUDIO_OUTPUT));
+        l.toggle_hidden(AUDIO_OUTPUT);
+        assert!(l.loadable(AUDIO_OUTPUT));
+        assert!(!l.loadable(4));
     }
 
     #[test]
