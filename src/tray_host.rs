@@ -1300,9 +1300,10 @@ fn create_host() -> Result<(), String> {
     if unsafe { RegisterClassExW(&wc_child) } == 0 {
         log!("tray: RegisterClassExW(TrayNotifyWnd) failed: {:?}", windows::core::Error::from_thread());
     }
-    let g = state().geom;
-    let (x, y) = (g.tray_area.left, g.tray_area.top);
-    let (cw, ch) = ((g.tray_area.right - g.tray_area.left).max(1), (g.tray_area.bottom - g.tray_area.top).max(1));
+    let geom = state().geom;
+    let g = host_rect(&geom, monitor_rect_of(&geom.bar));
+    let (x, y) = (g.left, g.top);
+    let (cw, ch) = ((g.right - g.left).max(1), (g.bottom - g.top).max(1));
     // SAFETY: class registered above; static PCWSTR literals; the window is never shown.
     let host = unsafe {
         CreateWindowExW(
@@ -1530,8 +1531,43 @@ fn sweep_dead() {
     }
 }
 
+/// Rectangle given to the hidden `Shell_TrayWnd`. Apps that position their own flyouts from
+/// `FindWindow("Shell_TrayWnd")` + `GetWindowRect` (e.g. Logitech G HUB's WinUI tray) infer the
+/// taskbar edge by comparing that rect with the monitor: a small floating rect matches no edge and
+/// they fall back to (0,0). So, like Explorer's, the window spans the monitor width and touches the
+/// screen edge, covering the bar's height. Pure (tested); `mon` = the bar's monitor rect.
+fn host_rect(g: &TrayGeometry, mon: RECT) -> RECT {
+    let b = g.bar;
+    if b.right <= b.left || b.bottom <= b.top || mon.right <= mon.left || mon.bottom <= mon.top {
+        return area_rect(g);
+    }
+    // Right edge = right end of the dock's tray area: such apps right-align their flyout to the
+    // taskbar's right end (where Explorer keeps the notification area), so it lands over our icons.
+    let right = area_rect(g).right.clamp(mon.left + 1, mon.right);
+    if g.edge == 1 {
+        RECT { left: mon.left, top: mon.top, right, bottom: b.bottom.clamp(mon.top + 1, mon.bottom) }
+    } else {
+        RECT { left: mon.left, top: b.top.clamp(mon.top, mon.bottom - 1), right, bottom: mon.bottom }
+    }
+}
+
+/// Monitor rectangle of `r` (nearest monitor); empty on failure.
+fn monitor_rect_of(r: &RECT) -> RECT {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    // SAFETY: `r` is a valid RECT; MONITOR_DEFAULTTONEAREST always returns a monitor.
+    let mon = unsafe { MonitorFromRect(r, MONITOR_DEFAULTTONEAREST) };
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    // SAFETY: `mi` is writable with `cbSize` set.
+    if unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
+        mi.rcMonitor
+    } else {
+        EMPTY_RECT
+    }
+}
+
 fn resize_host(hwnd: HWND) {
-    let g = area_rect(&state().geom);
+    let geom = state().geom;
+    let g = host_rect(&geom, monitor_rect_of(&geom.bar));
     let (w, h) = ((g.right - g.left).max(1), (g.bottom - g.top).max(1));
     // SAFETY: own window, same thread; without SWP_SHOWWINDOW it stays hidden.
     if let Err(e) = unsafe { SetWindowPos(hwnd, None, g.left, g.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE) } {
@@ -2254,6 +2290,22 @@ mod tests {
         // No window: only the block's process is checked (unchanged).
         assert!(appbar_block_allowed(OWN, OWN, None, |p| p == OWN));
         assert!(!appbar_block_allowed(666, OWN, None, medium));
+    }
+
+    #[test]
+    fn host_rect_spans_monitor_edge() {
+        let mon = RECT { left: 0, top: 0, right: 3840, bottom: 2160 };
+        let bar = RECT { left: 1200, top: 2065, right: 2640, bottom: 2146 };
+        let g = TrayGeometry { bar, tray_area: RECT { left: 2198, top: 2065, right: 2582, bottom: 2146 }, edge: 3 };
+        let r = host_rect(&g, mon);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 2065, 2582, 2160));
+        let top_bar = RECT { left: 1200, top: 12, right: 2640, bottom: 93 };
+        let g = TrayGeometry { bar: top_bar, tray_area: top_bar, edge: 1 };
+        let r = host_rect(&g, mon);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (0, 0, 2640, 93));
+        // no geometry yet: falls back to the tray area / bar
+        let g = TrayGeometry { bar: EMPTY_RECT, tray_area: EMPTY_RECT, edge: 3 };
+        assert_eq!(host_rect(&g, mon).right, 0);
     }
 
     #[test]
