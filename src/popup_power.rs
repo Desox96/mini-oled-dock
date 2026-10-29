@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::glyphs;
 use crate::log;
+use crate::i18n::tr;
 use crate::popup::{center_y, hline, lift, row_plate, toggle_switch, Content, HitMap, PopupKind, Reply};
 use crate::power::{self, PowerAction};
 use crate::surface::{rect_wh, Font, Surface, TEXT2_ALPHA, TEXT3_ALPHA, TEXT_ALPHA, WHITE};
@@ -64,13 +65,13 @@ pub(crate) fn new() -> Box<dyn Content> {
 
 fn label(id: u32) -> &'static str {
     match id {
-        ID_SLEEP => "Sleep",
-        ID_LOCK => "Lock",
-        ID_RESTART => "Restart",
-        ID_SHUTDOWN => "Shut down",
-        ID_AUTOSTART => "Start with Windows",
-        ID_SETTINGS => "Settings",
-        _ => "Exit dock",
+        ID_SLEEP => tr("Sleep", "Sospendi"),
+        ID_LOCK => tr("Lock", "Blocca"),
+        ID_RESTART => tr("Restart", "Riavvia"),
+        ID_SHUTDOWN => tr("Shut down", "Arresta il sistema"),
+        ID_AUTOSTART => tr("Start with Windows", "Avvia con Windows"),
+        ID_SETTINGS => tr("Settings", "Impostazioni"),
+        _ => tr("Exit dock", "Esci dal dock"),
     }
 }
 

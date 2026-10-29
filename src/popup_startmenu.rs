@@ -319,10 +319,9 @@ pub(crate) struct StartMenu {
     pending: Option<String>,
 }
 
-/// Creates the content; labels in the user's UI language (like the Start quick-links menu).
+/// Creates the content; labels in the dock language (`i18n`).
 pub(crate) fn new() -> Box<dyn Content> {
-    let italian = crate::popup::popup_start::ui_is_italian();
-    Box::new(make(if italian { &IT } else { &EN }))
+    Box::new(make(if crate::i18n::italian() { &IT } else { &EN }))
 }
 
 fn make(labels: &'static Labels) -> StartMenu {

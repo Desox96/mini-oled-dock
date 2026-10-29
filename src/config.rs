@@ -18,6 +18,17 @@ use serde::{Deserialize, Serialize};
 /// under the mouse pointer (Settings -> Screen -> "Pointer").
 pub const MONITOR_POINTER: &str = "pointer";
 
+/// Language of the dock's own texts (`i18n`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    /// The Windows display language (Italian when it is Italian, English otherwise).
+    #[default]
+    Auto,
+    En,
+    It,
+}
+
 /// Position of the bar.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -164,6 +175,8 @@ pub struct PinnedApp {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
+    /// Language of the dock: "auto" (Windows display language), "en" or "it" (`i18n`).
+    pub language: Language,
     pub position: Position,
     /// Display the bar sits on: empty = the primary monitor (default), otherwise a GDI device name
     /// such as "\\.\DISPLAY2". A display that is not connected falls back to the primary one.
@@ -267,6 +280,7 @@ pub const DEFAULT_TRAY_HIDDEN_GUIDS: [&str; 5] = [
 impl Default for Config {
     fn default() -> Self {
         Config {
+            language: Language::Auto,
             position: Position::Bottom,
             monitor: String::new(),
             autohide: true,
@@ -325,6 +339,8 @@ pub fn get() -> Arc<Config> {
 }
 
 pub(crate) fn set(c: Config) {
+    // Every path that changes the config ends here: the dock language follows it.
+    crate::i18n::apply(c.language);
     let new = Arc::new(c);
     match cell().lock() {
         Ok(mut g) => *g = new,
@@ -460,6 +476,11 @@ fn render(c: &Config) -> String {
         Position::Bottom => "bottom",
     };
     let bg = c.background.hex();
+    let lang = match c.language {
+        Language::Auto => "auto",
+        Language::En => "en",
+        Language::It => "it",
+    };
     format!(
         r#"{TEMPLATE_MARK}
 // Edit and save: changes are picked up within ~2 seconds, no restart needed.
@@ -469,6 +490,10 @@ fn render(c: &Config) -> String {
 // settings are kept; if the dock must save a change (pin, tray icon) before you fix it,
 // your file is first copied to config.json.bak so no edit is lost.
 {{
+  // Language of the dock: "auto" (follows the Windows display language), "en" or "it".
+  // Also sets the language of the clock, date and calendar names. Normally chosen in Settings.
+  "language": "{lang}",
+
   // Where the bar sits on screen: "top" or "bottom".
   "position": "{pos}",
 
@@ -519,7 +544,7 @@ fn render(c: &Config) -> String {
   // Show the date next to the clock.
   "show_date": {show_date},
 
-  // Clock format (Windows time picture, uses your system locale).
+  // Clock format (Windows time picture, uses the dock language, or your system locale with "auto").
   //   H / HH = hour 0-23      h / hh = hour 1-12      m / mm = minutes
   //   s / ss = seconds        t / tt = AM/PM marker
   // Examples: "HH:mm" -> 14:05 (24h)    "h:mm tt" -> 2:05 PM (12h)
@@ -1049,9 +1074,11 @@ mod tests {
         c.bar_opacity = 0;
         c.window_previews = false;
         c.win_opens_start = true;
+        c.language = Language::It;
         let r = render(&c);
         assert!(r.contains("\"window_previews\": false"));
         assert!(r.contains("\"win_opens_start\": true"));
+        assert!(r.contains("\"language\": \"it\""));
         assert!(r.contains("Get-StartApps") && r.contains("\"background\": \"#2E1119\""));
         assert!(!r.contains("\"bar_size\":"));
         assert_eq!(parse(&r).unwrap(), c);

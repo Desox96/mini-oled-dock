@@ -1740,7 +1740,7 @@ fn on_hover_picker_timer(h: HWND) {
     }
     let Some((i, key, name)) = multi_window_app(hover) else { return };
     let Some(a) = anchor_for(ItemId::App(i)) else { return };
-    let name = if name.is_empty() { "Window".to_string() } else { name };
+    let name = if name.is_empty() { crate::i18n::tr("Window", "Finestra").to_string() } else { name };
     crate::picker::open(a, &key, &name, &apps::windows_in_order(&key));
 }
 

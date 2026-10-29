@@ -39,6 +39,7 @@ mod config;
 mod datadir;
 mod glyphs;
 mod hook;
+mod i18n;
 mod icons;
 mod logger;
 mod mem;

@@ -23,10 +23,11 @@ use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::config::{
-    self, Background, Config, DisplayMode, Position, SizeRange, APP_ICON_SIZE, APP_TEXT_SIZE, BACKGROUND_PRESETS,
+    self, Background, Config, DisplayMode, Language, Position, SizeRange, APP_ICON_SIZE, APP_TEXT_SIZE, BACKGROUND_PRESETS,
     MODULE_SIZE, TRAY_ICON_SIZE,
 };
 use crate::glyphs;
+use crate::i18n::tr;
 use crate::log;
 use crate::msg::WM_DOCK_CONFIG_APPLY;
 use crate::popup::{self, center_y, hline, lift, row_plate, tick_ms, toggle_switch, Content, HitMap, PopupKind, Reply};
@@ -79,6 +80,8 @@ pub(crate) enum Page {
 /// A setting changed by a choice or a switch.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Setting {
+    /// `config.language`: System / English / Italiano.
+    Language,
     Position,
     /// Display the bar sits on (`config.monitor`); offered only with two or more displays.
     Monitor,
@@ -132,20 +135,24 @@ enum Item {
 fn items(c: &Config, page: Page, picker_open: bool, sc: &[Screen]) -> Vec<Item> {
     match page {
         Page::Main => {
-            let mut v = vec![Item::Section("Appearance"), Item::Choice(Setting::Position, "Position")];
+            let mut v = vec![
+                Item::Section(tr("Appearance", "Aspetto")),
+                Item::Choice(Setting::Language, tr("Language", "Lingua")),
+                Item::Choice(Setting::Position, tr("Position", "Posizione")),
+            ];
             if sc.len() > 1 {
-                v.push(Item::Choice(Setting::Monitor, "Screen"));
+                v.push(Item::Choice(Setting::Monitor, tr("Screen", "Schermo")));
             }
             v.extend([
-                Item::Choice(Setting::Display, "Display"),
-                Item::Open(Page::Background, "Background"),
-                Item::Open(Page::Sizes, "Sizes"),
-                Item::Section("Behavior"),
-                Item::Toggle(Setting::AutoHide, "Auto-hide"),
-                Item::Toggle(Setting::Previews, "Window previews"),
-                Item::Toggle(Setting::WinStart, "Win key opens Start"),
-                Item::Toggle(Setting::Seconds, "Clock seconds"),
-                Item::Section("Modules"),
+                Item::Choice(Setting::Display, tr("Display", "Mostra")),
+                Item::Open(Page::Background, tr("Background", "Sfondo")),
+                Item::Open(Page::Sizes, tr("Sizes", "Dimensioni")),
+                Item::Section(tr("Behavior", "Comportamento")),
+                Item::Toggle(Setting::AutoHide, tr("Auto-hide", "Nascondi automaticamente")),
+                Item::Toggle(Setting::Previews, tr("Window previews", "Anteprime finestre")),
+                Item::Toggle(Setting::WinStart, tr("Win key opens Start", "Il tasto Win apre Start")),
+                Item::Toggle(Setting::Seconds, tr("Clock seconds", "Secondi nell'orologio")),
+                Item::Section(tr("Modules", "Moduli")),
                 // The Start button is a fixed item at the left end of the bar, not part of `MODULE_NAMES`.
                 Item::Toggle(Setting::Module("start"), module_label("start")),
             ]);
@@ -156,19 +163,19 @@ fn items(c: &Config, page: Page, picker_open: bool, sc: &[Screen]) -> Vec<Item> 
             v
         }
         Page::Background => {
-            let mut v = vec![Item::Back("Background"), Item::ColourSection, Item::Swatches];
+            let mut v = vec![Item::Back(tr("Background", "Sfondo")), Item::ColourSection, Item::Swatches];
             if picker_open {
                 v.push(Item::Picker);
             }
-            v.push(Item::Slider(Slider::Opacity, "Opacity"));
+            v.push(Item::Slider(Slider::Opacity, tr("Opacity", "Opacit\u{e0}")));
             v
         }
         Page::Sizes => vec![
-            Item::Back("Sizes"),
-            Item::Slider(Slider::AppIcon, "App icons"),
-            Item::Slider(Slider::AppText, "App names"),
-            Item::Slider(Slider::TrayIcon, "Tray icons"),
-            Item::Slider(Slider::Module, "Modules"),
+            Item::Back(tr("Sizes", "Dimensioni")),
+            Item::Slider(Slider::AppIcon, tr("App icons", "Icone app")),
+            Item::Slider(Slider::AppText, tr("App names", "Nomi app")),
+            Item::Slider(Slider::TrayIcon, tr("Tray icons", "Icone area notifiche")),
+            Item::Slider(Slider::Module, tr("Modules", "Moduli")),
             Item::ResetSizes,
         ],
     }
@@ -177,27 +184,33 @@ fn items(c: &Config, page: Page, picker_open: bool, sc: &[Screen]) -> Vec<Item> 
 /// Row label of a `config::MODULE_NAMES` entry (or "start").
 fn module_label(name: &str) -> &'static str {
     match name {
-        "notifications" => "Notifications",
-        "volume" => "Volume",
-        "network" => "Network",
-        "metrics" => "System metrics",
-        "clock" => "Clock",
-        "show_desktop" => "Show desktop",
-        "start" => "Start button",
-        "tray" => "Tray icons",
-        _ => "Module",
+        "notifications" => tr("Notifications", "Notifiche"),
+        "volume" => tr("Volume", "Volume"),
+        "network" => tr("Network", "Rete"),
+        "metrics" => tr("System metrics", "Risorse di sistema"),
+        "clock" => tr("Clock", "Orologio"),
+        "show_desktop" => tr("Show desktop", "Mostra desktop"),
+        "start" => tr("Start button", "Pulsante Start"),
+        "tray" => tr("Tray icons", "Icone area notifiche"),
+        _ => tr("Module", "Modulo"),
     }
 }
 
 /// Labels of the segments of a choice (`sc`: the displays, for the screen choice).
 fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
     match s {
-        Setting::Position => vec!["Top", "Bottom"],
+        // Each language in its own name, so it can be found whatever the current one is.
+        Setting::Language => vec![tr("System", "Sistema"), "English", "Italiano"],
+        Setting::Position => vec![tr("Top", "In alto"), tr("Bottom", "In basso")],
         Setting::Monitor => {
             // Last segment: follow the pointer (`config::MONITOR_POINTER`).
-            sc.iter().map(|d| if d.primary { "Main" } else { d.label }).chain(std::iter::once("Pointer")).collect()
+            let main = tr("Main", "Principale");
+            sc.iter()
+                .map(|d| if d.primary { main } else { d.label })
+                .chain(std::iter::once(tr("Pointer", "Puntatore")))
+                .collect()
         }
-        Setting::Display => vec!["Icon + name", "Icon", "Name"],
+        Setting::Display => vec![tr("Icon + name", "Icona + nome"), tr("Icon", "Icona"), tr("Name", "Nome")],
         _ => Vec::new(),
     }
 }
@@ -206,6 +219,11 @@ fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
 /// when none is chosen or the chosen one is not connected (that is where the bar is).
 fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
     Some(match s {
+        Setting::Language => match c.language {
+            Language::Auto => 0,
+            Language::En => 1,
+            Language::It => 2,
+        },
         Setting::Position => usize::from(c.position == Position::Bottom),
         Setting::Monitor => {
             if c.monitor.eq_ignore_ascii_case(config::MONITOR_POINTER) {
@@ -227,6 +245,7 @@ fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
 /// primary monitor even if Windows changes which one it is).
 fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
     match s {
+        Setting::Language => c.language = [Language::Auto, Language::En, Language::It][j.min(2)],
         Setting::Position => c.position = if j == 0 { Position::Top } else { Position::Bottom },
         Setting::Monitor => {
             c.monitor = if j == sc.len() {
@@ -359,6 +378,13 @@ fn rgb_to_hsv((r, g, b): (u32, u32, u32)) -> (f32, f32, f32) {
 fn background_of((h, s, v): (f32, f32, f32)) -> Background {
     let (r, g, b) = hsv_to_rgb(h, s, v);
     Background(r << 16 | g << 8 | b)
+}
+
+/// Name of preset `k` in the dock language (the table keeps the English one).
+fn preset_name(k: usize) -> &'static str {
+    const IT: [&str; 7] = ["Nero", "Grafite", "Ardesia", "Blu notte", "Prugna", "Vinaccia", "Verde bosco"];
+    let en = BACKGROUND_PRESETS.get(k).map_or("", |p| p.0);
+    crate::i18n::tr(en, IT.get(k).copied().unwrap_or(en))
 }
 
 /// Index of the preset equal to `bg`.
@@ -740,9 +766,9 @@ impl Content for SettingsPopup {
                 }
                 Item::ColourSection => {
                     let ty = y + h - lsm - m.px(4);
-                    s.text("Colour", col, ty, Font::Small, WHITE, TEXT3_ALPHA);
+                    s.text(tr("Colour", "Colore"), col, ty, Font::Small, WHITE, TEXT3_ALPHA);
                     let bg = self.cfg.background;
-                    let name = preset_index(bg).map_or_else(|| "Custom".to_string(), |k| BACKGROUND_PRESETS[k].0.to_string());
+                    let name = preset_index(bg).map_or_else(|| tr("Custom", "Personalizzato").to_string(), |k| preset_name(k).to_string());
                     let nw = s.text_width(&name, Font::Small);
                     s.text(&name, self.width - col - nw, ty, Font::Small, WHITE, TEXT2_ALPHA);
                 }
@@ -815,7 +841,7 @@ impl Content for SettingsPopup {
                 Item::TrayChooser => {
                     let lit = row_plate(s, row, item_id(i, None), hot, pressed);
                     let ty = center_y(&row, ln);
-                    s.text("Choose tray icons", row.left + m.px(12), ty, Font::Normal, WHITE, lift(TEXT_ALPHA, lit));
+                    s.text(tr("Choose tray icons", "Scegli icone area notifiche"), row.left + m.px(12), ty, Font::Normal, WHITE, lift(TEXT_ALPHA, lit));
                     let cw = s.text_width("\u{203A}", Font::Normal);
                     chevron(s, &row, "\u{203A}", row.right - m.px(12) - cw, lit);
                 }
@@ -829,7 +855,7 @@ impl Content for SettingsPopup {
                     let enabled = !sizes_are_default(&self.cfg);
                     let lit = enabled && row_plate(s, row, item_id(i, None), hot, pressed);
                     let a = if enabled { lift(TEXT_ALPHA, lit) } else { TEXT3_ALPHA };
-                    s.text("Reset sizes", row.left + m.px(12), center_y(&row, ln), Font::Normal, WHITE, a);
+                    s.text(tr("Reset sizes", "Ripristina dimensioni"), row.left + m.px(12), center_y(&row, ln), Font::Normal, WHITE, a);
                 }
             }
         }
@@ -965,7 +991,7 @@ mod tests {
     fn choices_roundtrip() {
         let mut c = Config::default();
         let sc = test_screens();
-        for set in [Setting::Position, Setting::Monitor, Setting::Display] {
+        for set in [Setting::Language, Setting::Position, Setting::Monitor, Setting::Display] {
             for j in 0..options(set, &sc).len() {
                 choose(&mut c, set, j, &sc);
                 assert_eq!(selected(&c, set, &sc), Some(j));
@@ -1049,6 +1075,11 @@ mod tests {
             assert_eq!(background_of(rgb_to_hsv(bg.rgb())), bg);
         }
         assert_eq!(hsv_to_rgb(359.9, 1.0, 1.0).0, 255);
+    }
+
+    #[test]
+    fn every_preset_has_an_italian_name() {
+        assert_eq!(BACKGROUND_PRESETS.len(), 7, "update the Italian names in preset_name");
     }
 
     #[test]

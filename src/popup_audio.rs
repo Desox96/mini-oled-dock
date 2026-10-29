@@ -180,7 +180,7 @@ impl Content for AudioPopup {
         s.text(&pct, self.pct_right - tw, center_y(&btn_rc, lh), Font::Normal, WHITE, TEXT2_ALPHA);
 
         hline(s, m.px(TEXT_COL), self.width - m.px(TEXT_COL), self.sep1);
-        s.text("Output", m.px(TEXT_COL), self.y_label, Font::Small, WHITE, TEXT3_ALPHA);
+        s.text(crate::i18n::tr("Output", "Uscita"), m.px(TEXT_COL), self.y_label, Font::Small, WHITE, TEXT3_ALPHA);
 
         // Devices.
         match self.outputs.as_ref() {
@@ -209,13 +209,13 @@ impl Content for AudioPopup {
             }
             Some(_) => {
                 let rc = rect_wh(0, self.y_empty, self.width, m.px(34));
-                let txt = "No output device";
+                let txt = crate::i18n::tr("No output device", "Nessun dispositivo di uscita");
                 let tw = s.text_width(txt, Font::Normal);
                 s.text(txt, (self.width - tw) / 2, center_y(&rc, lh), Font::Normal, WHITE, TEXT2_ALPHA);
             }
             None => {
                 let rc = rect_wh(0, self.y_empty, self.width, m.px(34));
-                let txt = "Loading\u{2026}";
+                let txt = crate::i18n::tr("Loading\u{2026}", "Caricamento\u{2026}");
                 let tw = s.text_width(txt, Font::Small);
                 s.text(
                     txt,
@@ -231,7 +231,7 @@ impl Content for AudioPopup {
         hline(s, m.px(TEXT_COL), self.width - m.px(TEXT_COL), self.sep2);
         if let Some(rc) = self.hits.rect(ID_MIXER) {
             let h = row_plate(s, rc, ID_MIXER, hot, pressed);
-            s.text("Volume mixer", rc.left + m.px(12), center_y(&rc, lh), Font::Normal, WHITE, lift(TEXT_ALPHA, h));
+            s.text(crate::i18n::tr("Volume mixer", "Mixer volume"), rc.left + m.px(12), center_y(&rc, lh), Font::Normal, WHITE, lift(TEXT_ALPHA, h));
         }
     }
 
