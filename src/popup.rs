@@ -246,6 +246,10 @@ pub(crate) enum Button {
 pub(crate) enum DataEvent {
     Volume(VolumeState),
     AudioOutputs(Vec<OutputDevice>),
+    /// Spatial sound formats of the default output (`None` = not supported: section hidden).
+    Spatial(Option<crate::audio::SpatialState>),
+    /// Per-app audio sessions of the default output (volume mixer rows).
+    AudioSessions(Vec<crate::audio::AppSession>),
     NotifChanged,
     TrayChanged,
     Network(crate::net::NetInfo),
@@ -563,6 +567,20 @@ pub fn on_volume(st: VolumeState) {
 pub fn on_audio_outputs(list: Vec<OutputDevice>) {
     if is_open() {
         dispatch(DataEvent::AudioOutputs(list));
+    }
+}
+
+/// `ShellEvent::Spatial` reached the UI. Called by `ui`.
+pub fn on_audio_spatial(state: Option<crate::audio::SpatialState>) {
+    if current() == Some(PopupKind::Audio) {
+        dispatch(DataEvent::Spatial(state));
+    }
+}
+
+/// `ShellEvent::AudioSessions` reached the UI. Called by `ui`.
+pub fn on_audio_sessions(list: Vec<crate::audio::AppSession>) {
+    if current() == Some(PopupKind::Audio) {
+        dispatch(DataEvent::AudioSessions(list));
     }
 }
 

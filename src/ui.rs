@@ -1448,6 +1448,15 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
             popup::on_start_icons(icon_px, icons);
             return false;
         }
+        // Spatial sound and per-app mixer data: only the audio popup uses them.
+        ShellEvent::Spatial(state) => {
+            popup::on_audio_spatial(state);
+            return false;
+        }
+        ShellEvent::AudioSessions(list) => {
+            popup::on_audio_sessions(list);
+            return false;
+        }
         other => other,
     };
     UI.with(|u| {
@@ -1481,7 +1490,11 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
                 false
             }
             // Handled before the borrow.
-            ShellEvent::Network(_) | ShellEvent::StartApps(_) | ShellEvent::StartIcons { .. } => false,
+            ShellEvent::Network(_)
+            | ShellEvent::StartApps(_)
+            | ShellEvent::StartIcons { .. }
+            | ShellEvent::Spatial(_)
+            | ShellEvent::AudioSessions(_) => false,
         }
     })
 }

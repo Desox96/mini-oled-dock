@@ -64,7 +64,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::audio::{self, AudioController};
 use crate::icons::{self, IconBitmap, MASTER_PX};
 use crate::log;
-use crate::msg::{WM_DOCK_SHELL_READY, WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_WAKE};
+use crate::msg::{WM_DOCK_SHELL_READY, WM_SHELL_AUDIO_DEVICE_CHANGED, WM_SHELL_SPATIAL_CHANGED, WM_SHELL_WAKE};
 
 // ------------------------------------------------------------------ public types
 
@@ -155,6 +155,18 @@ pub enum ShellRequest {
     /// make `id` the default output device (IPolicyConfig), then republish
     /// `ShellEvent::AudioOutputs` and the volume. On failure: log + `Launch("ms-settings:sound")`.
     SetDefaultOutput { id: String },
+    /// Audio popup: read the spatial sound formats of the default output -> `ShellEvent::Spatial`.
+    ListSpatial,
+    /// Audio popup: make `subtype` (empty = Off) the default spatial format. Runs on a short-lived
+    /// thread; when it ends `ShellEvent::Spatial` is pushed again (if the popup is still open).
+    SetSpatialFormat { subtype: String },
+    /// Audio popup: enumerate the per-app sessions of the default output -> `ShellEvent::AudioSessions`.
+    ListSessions,
+    /// Audio popup: set the level (0..=100) of all the sessions of one mixer row. No reply (the
+    /// popup asks `ListSessions` when the drag ends).
+    SetSessionVolume { pid: u32, system: bool, level: u8 },
+    /// Audio popup: toggle the mute of all the sessions of one mixer row -> `ShellEvent::AudioSessions`.
+    ToggleSessionMute { pid: u32, system: bool },
     /// "Show desktop" (`IShellDispatch4::ToggleDesktop`, fallback Win+D with `INJECT_TAG`).
     ToggleDesktop,
     /// "Start" button: synthetic Win press and release with `INJECT_TAG` (opens / closes the Start menu).
@@ -189,6 +201,12 @@ pub enum ShellEvent {
     /// active output devices (reply to `ListOutputs`/`SetDefaultOutput`, and
     /// spontaneously after `WM_SHELL_AUDIO_DEVICE_CHANGED`). Empty = none / error.
     AudioOutputs(Vec<audio::OutputDevice>),
+    /// Spatial sound state of the default output (`None` = not supported). Reply to `ListSpatial`,
+    /// and pushed after a format change or a device change while the audio popup is open.
+    Spatial(Option<audio::SpatialState>),
+    /// Per-app mixer rows of the default output (reply to `ListSessions` / `ToggleSessionMute`, and
+    /// after a device change while the audio popup is open).
+    AudioSessions(Vec<audio::AppSession>),
     /// Status of the active network connection (reply to `NetworkQuery`).
     Network(crate::net::NetInfo),
     /// The AppsFolder catalog (reply to `ListStartApps`), in enumeration order.
@@ -373,6 +391,11 @@ fn thread_main(ui: isize, rx: Receiver<ShellRequest>, ready: Sender<u32>) {
             WM_SHELL_WAKE => {}
             WM_TIMER if msg.hwnd.0.is_null() => {}
             WM_SHELL_AUDIO_DEVICE_CHANGED => shell.on_audio_device_changed(),
+            WM_SHELL_SPATIAL_CHANGED => {
+                if audio::popup_open() {
+                    shell.push_spatial();
+                }
+            }
             _ => {
                 // SAFETY: `msg` was just filled by GetMessageW; needed by COM STA for its internal messages.
                 unsafe {
@@ -424,6 +447,35 @@ impl Shell {
         self.publish_volume(st);
         let list = self.audio.as_ref().map(|a| a.list_outputs()).unwrap_or_default();
         push_event(self.ui, ShellEvent::AudioOutputs(list));
+        // The spatial formats and the sessions belong to the default device: re-read them, but
+        // only while the audio popup shows them.
+        if audio::popup_open() {
+            self.push_spatial();
+            self.push_sessions();
+        }
+    }
+
+    /// Reads the spatial sound state now (nothing kept) and pushes it to the UI.
+    fn push_spatial(&mut self) {
+        self.ensure_audio();
+        let st = self.audio.as_ref().and_then(|a| a.spatial());
+        push_event(self.ui, ShellEvent::Spatial(st));
+    }
+
+    /// Enumerates the per-app sessions now (no COM object kept), resolves the row names and pushes
+    /// them to the UI.
+    fn push_sessions(&mut self) {
+        self.ensure_audio();
+        let raw = self.audio.as_ref().map(|a| a.list_sessions()).unwrap_or_default();
+        let mut rows = audio::group_sessions(&raw);
+        for r in rows.iter_mut() {
+            if r.system {
+                r.name = crate::i18n::tr("System sounds", "Suoni di sistema").to_string();
+            } else if r.name.is_empty() {
+                r.name = session_app_name(r.pid);
+            }
+        }
+        push_event(self.ui, ShellEvent::AudioSessions(rows));
     }
 
     /// Drains the mpsc queue and works through the requests: volume/launch first, then the (slow)
@@ -487,6 +539,28 @@ impl Shell {
                 }
                 let list = self.audio.as_ref().map(|a| a.list_outputs()).unwrap_or_default();
                 push_event(self.ui, ShellEvent::AudioOutputs(list));
+            }
+            ShellRequest::ListSpatial => self.push_spatial(),
+            ShellRequest::SetSpatialFormat { subtype } => {
+                self.ensure_audio();
+                match self.audio.as_ref().and_then(|a| a.default_winrt_id()) {
+                    Some(id) => audio::spawn_set_spatial(id, subtype),
+                    None => log!("shell: SetSpatialFormat: no default output device"),
+                }
+            }
+            ShellRequest::ListSessions => self.push_sessions(),
+            ShellRequest::SetSessionVolume { pid, system, level } => {
+                self.ensure_audio();
+                if let Some(a) = self.audio.as_ref() {
+                    a.set_session_volume(pid, system, level);
+                }
+            }
+            ShellRequest::ToggleSessionMute { pid, system } => {
+                self.ensure_audio();
+                if let Some(a) = self.audio.as_ref() {
+                    a.toggle_session_mute(pid, system);
+                }
+                self.push_sessions();
             }
             ShellRequest::ToggleDesktop => toggle_desktop(),
             ShellRequest::OpenStart => send_win_alone(),
@@ -673,6 +747,22 @@ fn natural_name(r: &ResolveApp) -> (String, &'static str) {
         }
     }
     (r.key.clone(), "key")
+}
+
+/// Name of a mixer row without a usable session display name: the exe FileDescription (generic
+/// tails stripped), else the prettified exe stem, else "PID n". Nothing is cached.
+fn session_app_name(pid: u32) -> String {
+    let Some(path) = crate::apps::exe_path_of_pid(pid) else { return format!("PID {pid}") };
+    if let Some(d) = FileInfo::read(&path).description.as_deref().map(strip_generic).filter(|d| !d.is_empty()) {
+        return d;
+    }
+    let stem = Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let pretty = pretty_stem(&stem);
+    if pretty.is_empty() {
+        format!("PID {pid}")
+    } else {
+        pretty
+    }
 }
 
 /// True for executables under `%SystemRoot%`.

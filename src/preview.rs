@@ -272,6 +272,37 @@ fn mock_outputs() -> Vec<OutputDevice> {
     ]
 }
 
+/// Mock spatial sound: Off, Windows Sonic (current), Dolby Atmos for Headphones.
+fn mock_spatial() -> crate::audio::SpatialState {
+    use crate::audio::{SpatialKind, SpatialOption};
+    let opt = |kind, subtype: &str| SpatialOption { kind, subtype: subtype.to_string() };
+    crate::audio::SpatialState {
+        options: vec![
+            opt(SpatialKind::Off, ""),
+            opt(SpatialKind::WindowsSonic, "sonic"),
+            opt(SpatialKind::DolbyAtmosHeadphones, "atmos"),
+        ],
+        current: Some(1),
+    }
+}
+
+/// Mock mixer rows.
+fn mock_sessions() -> Vec<crate::audio::AppSession> {
+    let row = |pid, system, name: &str, level, muted| crate::audio::AppSession {
+        pid,
+        system,
+        name: name.to_string(),
+        level,
+        muted,
+    };
+    vec![
+        row(10, false, "Google Chrome", 80, false),
+        row(20, false, "Spotify", 45, false),
+        row(30, false, "Discord", 100, true),
+        row(0, true, "System sounds", 60, false),
+    ]
+}
+
 /// Mock network: Wi-Fi with a good signal and internet.
 fn mock_net() -> NetInfo {
     NetInfo {
@@ -510,6 +541,8 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
         "popup_audio" => {
             let mut c = crate::popup_audio::new(VolumeState { level: 60, muted: false, available: true });
             c.data(&DataEvent::AudioOutputs(mock_outputs()));
+            c.data(&DataEvent::Spatial(Some(mock_spatial())));
+            c.data(&DataEvent::AudioSessions(mock_sessions()));
             c
         }
         "popup_calendar" => crate::popup_calendar::new(),
