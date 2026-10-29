@@ -34,8 +34,9 @@ use windows::Win32::Graphics::Gdi::HGDIOBJ;
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, WIN32_FIND_DATAW};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, IDispatch, IPersistFile,
-    IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
+    CoAllowSetForegroundWindow, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, IDispatch,
+    IPersistFile, IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED,
+    STGM_READ,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcessToken};
 use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR, VT_I4};
@@ -56,9 +57,10 @@ use windows::Win32::UI::Shell::{
     CSIDL_DESKTOP, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, DispatchMessageW, GetClassLongPtrW, GetMessageW, KillTimer, PeekMessageW, PostMessageW,
-    PostThreadMessageW, SendMessageTimeoutW, SetTimer, TranslateMessage, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG,
-    ICON_SMALL2, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, WM_GETICON, WM_QUIT, WM_TIMER,
+    AllowSetForegroundWindow, DestroyIcon, DispatchMessageW, GetClassLongPtrW, GetMessageW, GetWindowThreadProcessId,
+    KillTimer, PeekMessageW, PostMessageW, PostThreadMessageW, SendMessageTimeoutW, SetTimer, TranslateMessage,
+    ASFW_ANY, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL2, MSG, PM_NOREMOVE, SMTO_ABORTIFHUNG, SW_SHOWNORMAL,
+    WM_GETICON, WM_QUIT, WM_TIMER,
 };
 
 use crate::audio::{self, AudioController};
@@ -1550,6 +1552,7 @@ impl Drop for OwnedVariant {
 /// -> `IShellBrowser::QueryActiveShellView` -> `IShellView::GetItemObject(SVGIO_BACKGROUND)`
 /// -> `IShellFolderViewDual::Application` -> `IShellDispatch2::ShellExecute(..., verb, SW_SHOWNORMAL)`.
 /// `verb` is `Open` for every launch except `launch_admin` (`RunAs`: Explorer asks UAC, not the dock).
+/// Before executing, grants foreground rights to Explorer so the launched app opens in the foreground.
 /// Must be called on a COM STA thread (the shell thread).
 fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb: Verb) -> windows::core::Result<()> {
     // SAFETY: COM STA initialized on the shell thread; every interface below is used only on this
@@ -1566,6 +1569,16 @@ fn desktop_shell_execute(file: &str, args: Option<&str>, dir: Option<&str>, verb
         let background: IDispatch = view.GetItemObject(SVGIO_BACKGROUND)?;
         let folder_view: IShellFolderViewDual = background.cast()?;
         let shell: IShellDispatch2 = folder_view.Application()?.cast()?;
+        // Foreground rights: the dock received the click, Explorer did not. Without this the
+        // de-elevated app (started by Explorer) opens behind the current foreground window.
+        // Grant them to Explorer (desktop window owner), which passes them on to the process it
+        // starts; ASFW_ANY as a fallback. Both expire at the next user input.
+        let mut explorer_pid = 0u32;
+        GetWindowThreadProcessId(HWND(hwnd as isize as *mut c_void), Some(&mut explorer_pid));
+        if explorer_pid == 0 || AllowSetForegroundWindow(explorer_pid).is_err() {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+        }
+        let _ = CoAllowSetForegroundWindow(&shell, None);
         shell.ShellExecute(
             &BSTR::from(file),
             &OwnedVariant::opt_bstr(args).0,
