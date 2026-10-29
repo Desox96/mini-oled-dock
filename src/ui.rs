@@ -123,6 +123,11 @@ const TIMER_WIDTH: usize = 40;
 /// After a popup closes, a foreground change to the fullscreen app within this
 /// time (ms) is the automatic focus return and does not hide the dock.
 const POPUP_CLOSE_GRACE_MS: u64 = 400;
+/// Right after the dock/popup take the foreground over a fullscreen app, a foreground change back
+/// to that app within this time (ms) is the app bouncing it back (or a stale event), not the user.
+const FS_BOUNCE_GRACE_MS: u64 = 800;
+/// How many times the foreground is re-taken after such a bounce, per show of the dock.
+const FS_MAX_RETAKES: u32 = 2;
 /// Duration of the width animation (ms, out-cubic).
 const WIDTH_ANIM_MS: u64 = 160;
 /// Timer of the attention blink (local id).
@@ -167,6 +172,10 @@ static EDGE_ARMED: AtomicBool = AtomicBool::new(true);
 static FS_SHOWN: AtomicBool = AtomicBool::new(false);
 /// HWND (as isize) of the fullscreen app under the dock, to give it the foreground back.
 static FS_PREV: AtomicIsize = AtomicIsize::new(0);
+/// Tick (ms) of the last `force_foreground` call (0 = never).
+static FG_TAKEN_AT: AtomicU64 = AtomicU64::new(0);
+/// Foreground re-takes after a fullscreen bounce since the dock was shown.
+static FS_RETAKES: AtomicU32 = AtomicU32::new(0);
 /// Previous state of the left/right mouse buttons (falling-edge detection).
 static CLICK_DOWN: AtomicBool = AtomicBool::new(false);
 /// Id of the registered "SHELLHOOK" window message (0 = not registered).
@@ -2827,6 +2836,7 @@ pub fn show_dock(reason: &str, hide_after_ms: u64) {
     if !was_visible {
         FS_SHOWN.store(fs.is_some(), Relaxed);
         FS_PREV.store(fs.map(|h| h.0 as isize).unwrap_or(0), Relaxed);
+        FS_RETAKES.store(0, Relaxed);
         CLICK_DOWN.store(mouse_buttons_down(), Relaxed);
         if let Some(h) = fs {
             log!("  fullscreen foreground window: \"{}\"", window_title(h));
@@ -3079,6 +3089,13 @@ fn on_foreground_changed(fg: HWND) {
     if !VISIBLE.load(Relaxed) || fg.0.is_null() || is_own_window(fg) || tray_host::foreign_menu_active() {
         return;
     }
+    // The event is posted: by now the foreground may already be ours again (stale event).
+    // SAFETY: no preconditions.
+    let cur = unsafe { GetForegroundWindow() };
+    if !cur.0.is_null() && is_own_window(cur) {
+        log!("foreground event ignored: the foreground is ours again");
+        return;
+    }
     let Some(g) = GEOM.with(|g| g.get()) else { return };
     if FS_SHOWN.load(Relaxed) {
         // Closing one of our popups gives the foreground back to the game: it is not a user click.
@@ -3087,10 +3104,31 @@ fn on_foreground_changed(fg: HWND) {
             log!("foreground returned to the game by closing a popup: the dock stays");
             return;
         }
+        // The game bounced the foreground back right after we took it: take it again (a few times).
+        if fs_bounce_grace(fg) && FS_RETAKES.load(Relaxed) < FS_MAX_RETAKES {
+            let n = FS_RETAKES.fetch_add(1, Relaxed) + 1;
+            log!("fullscreen app bounced the foreground back right after the dock took it: re-taking it ({n})");
+            force_foreground(popup::current_hwnd().unwrap_or_else(hwnd));
+            return;
+        }
         hide_dock("foreground moved to another window (fullscreen)");
     } else if fullscreen_window(&g.mon).is_some() {
         hide_dock("a fullscreen app took the foreground");
     }
+}
+
+/// true if `fg` is the fullscreen app under the dock and the dock/popup took the foreground less
+/// than `FS_BOUNCE_GRACE_MS` ago: the change is the app bouncing it back, not a user action.
+/// `pub` because `popup` must not close on that bounce either.
+pub fn fs_bounce_grace(fg: HWND) -> bool {
+    FS_SHOWN.load(Relaxed)
+        && fg.0 as isize == FS_PREV.load(Relaxed)
+        && within_grace(now_ms(), FG_TAKEN_AT.load(Relaxed), FS_BOUNCE_GRACE_MS)
+}
+
+/// true if `taken_at` (0 = never) is less than `grace` ms before `now`.
+fn within_grace(now: u64, taken_at: u64, grace: u64) -> bool {
+    taken_at != 0 && now.saturating_sub(taken_at) < grace
 }
 
 /// "Foreground" fallback (the foreground fallback of the original design).
@@ -3099,6 +3137,7 @@ fn on_foreground_changed(fg: HWND) {
 /// lock) and SetForegroundWindow again. The outcome of each is in the log.
 /// `pub` because `popup` also uses it to activate the popup window.
 pub fn force_foreground(h: HWND) {
+    FG_TAKEN_AT.store(now_ms(), Relaxed);
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
     if fg.0.is_null() {
@@ -3280,5 +3319,14 @@ mod tests {
         reorder_pinned(&mut c, &["c".to_string(), "a".to_string(), "b".to_string()]);
         let keys: Vec<&str> = c.pinned.iter().map(|p| p.key.as_str()).collect();
         assert_eq!(keys, ["c", "x", "a", "b"]);
+    }
+
+    #[test]
+    fn bounce_grace_window_edges() {
+        assert!(!within_grace(1000, 0, 800), "never taken");
+        assert!(within_grace(1000, 1000, 800));
+        assert!(within_grace(1799, 1000, 800));
+        assert!(!within_grace(1800, 1000, 800));
+        assert!(within_grace(900, 1000, 800), "clock before the take saturates to 0");
     }
 }

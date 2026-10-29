@@ -534,6 +534,12 @@ pub fn is_open() -> bool {
     STATE.with(|s| s.try_borrow().map(|g| g.open.is_some()).unwrap_or(false))
 }
 
+/// Window of the open popup (None if no popup is open).
+pub fn current_hwnd() -> Option<HWND> {
+    let h = POPUP_HWND.load(std::sync::atomic::Ordering::Relaxed);
+    (h != 0 && is_open()).then(|| HWND(h as *mut _))
+}
+
 /// Kind of the open popup (the UI keeps the plate on the matching item).
 pub fn current() -> Option<PopupKind> {
     STATE.with(|s| s.try_borrow().ok().and_then(|g| g.open.as_ref().map(|o| o.kind)))
@@ -1023,7 +1029,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
     match msg {
         WM_ACTIVATE => {
             if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                on_inactive();
+                // lParam: the window being activated (may be null or of another thread).
+                on_inactive(HWND(lp.0 as *mut _));
             } else {
                 mark_active(hwnd);
             }
@@ -1119,9 +1126,14 @@ fn mark_active(hwnd: HWND) {
     }
 }
 
-fn on_inactive() {
+fn on_inactive(other: HWND) {
     let kind = with(|st| st.open.as_ref().map(|o| o.kind)).flatten();
     if let Some(k) = kind {
+        // A fullscreen app bouncing the foreground back right after we took it: the UI re-takes it.
+        if crate::ui::fs_bounce_grace(other) {
+            log!("popup: focus lost to the fullscreen app's bounce: staying open");
+            return;
+        }
         with(|st| st.last_inactive = Some((k, now_ms())));
         close_inner("focus lost");
     }
@@ -1339,7 +1351,7 @@ fn on_tick(hwnd: HWND) {
         // Activation was seen: if the foreground is now another window, WA_INACTIVE was missed.
         // SAFETY: no preconditions.
         let fg = unsafe { GetForegroundWindow() };
-        if fg != hwnd && !fg.0.is_null() {
+        if fg != hwnd && !fg.0.is_null() && !crate::ui::fs_bounce_grace(fg) {
             close_inner("foreground changed");
             return;
         }
@@ -1353,7 +1365,7 @@ fn on_tick(hwnd: HWND) {
                     o.was_active = true;
                 }
             });
-        } else if fg != fg_at_open {
+        } else if fg != fg_at_open && !crate::ui::fs_bounce_grace(fg) {
             close_inner("foreground changed");
             return;
         }
