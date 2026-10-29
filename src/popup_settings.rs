@@ -190,7 +190,10 @@ fn module_label(name: &str) -> &'static str {
 fn options(s: Setting, sc: &[Screen]) -> Vec<&'static str> {
     match s {
         Setting::Position => vec!["Top", "Bottom"],
-        Setting::Monitor => sc.iter().map(|d| if d.primary { "Main" } else { d.label }).collect(),
+        Setting::Monitor => {
+            // Last segment: follow the pointer (`config::MONITOR_POINTER`).
+            sc.iter().map(|d| if d.primary { "Main" } else { d.label }).chain(std::iter::once("Pointer")).collect()
+        }
         Setting::Display => vec!["Icon + name", "Icon", "Name"],
         _ => Vec::new(),
     }
@@ -202,7 +205,11 @@ fn selected(c: &Config, s: Setting, sc: &[Screen]) -> Option<usize> {
     Some(match s {
         Setting::Position => usize::from(c.position == Position::Bottom),
         Setting::Monitor => {
-            sc.iter().position(|d| !d.primary && d.device.eq_ignore_ascii_case(&c.monitor)).unwrap_or(0)
+            if c.monitor.eq_ignore_ascii_case(config::MONITOR_POINTER) {
+                sc.len()
+            } else {
+                sc.iter().position(|d| !d.primary && d.device.eq_ignore_ascii_case(&c.monitor)).unwrap_or(0)
+            }
         }
         Setting::Display => match c.display_mode {
             DisplayMode::IconText => 0,
@@ -219,7 +226,11 @@ fn choose(c: &mut Config, s: Setting, j: usize, sc: &[Screen]) {
     match s {
         Setting::Position => c.position = if j == 0 { Position::Top } else { Position::Bottom },
         Setting::Monitor => {
-            c.monitor = sc.get(j).filter(|d| !d.primary).map(|d| d.device.clone()).unwrap_or_default();
+            c.monitor = if j == sc.len() {
+                config::MONITOR_POINTER.to_string()
+            } else {
+                sc.get(j).filter(|d| !d.primary).map(|d| d.device.clone()).unwrap_or_default()
+            };
         }
         Setting::Display => {
             c.display_mode = [DisplayMode::IconText, DisplayMode::Icon, DisplayMode::Text][j.min(2)];
@@ -965,7 +976,12 @@ mod tests {
     #[test]
     fn screen_choice() {
         let sc = test_screens();
-        assert_eq!(options(Setting::Monitor, &sc), ["Main", "2", "3"]);
+        assert_eq!(options(Setting::Monitor, &sc), ["Main", "2", "3", "Pointer"]);
+        // "Pointer" is stored as `MONITOR_POINTER` and selected back.
+        let mut p = Config::default();
+        choose(&mut p, Setting::Monitor, 3, &sc);
+        assert_eq!(p.monitor, config::MONITOR_POINTER);
+        assert_eq!(selected(&p, Setting::Monitor, &sc), Some(3));
         let mut c = Config::default();
         assert_eq!(selected(&c, Setting::Monitor, &sc), Some(0));
         choose(&mut c, Setting::Monitor, 2, &sc);

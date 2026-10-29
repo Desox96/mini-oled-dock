@@ -61,6 +61,10 @@ pub const WM_POPUP_OUTSIDE: u32 = WM_APP + 14;
 /// (`config::modify`). wParam = lParam = 0. Posted so the bar is rebuilt OUTSIDE the popup's
 /// wnd_proc (no re-entry). `main` calls `ui::on_config_changed()`.
 pub const WM_DOCK_CONFIG_APPLY: u32 = WM_APP + 15;
+/// hook -> UI: the Win key was tapped alone twice in quick succession (`hook::DOUBLE_TAP_MS`): open the
+/// dock's Start menu (`popup_startmenu`). wParam = 0, lParam = 0. Posted by the `hook` thread
+/// INSTEAD of the second `WM_DOCK_TOGGLE`. `main` calls `ui::open_start_menu()`.
+pub const WM_DOCK_START_MENU: u32 = WM_APP + 16;
 
 // `WM_APP + 10` is RESERVED: it is the UI -> hook thread THREAD message (PostThreadMessageW)
 // defined privately in `hook.rs` (`WM_HOOK_REINSTALL`). Do not reuse it.

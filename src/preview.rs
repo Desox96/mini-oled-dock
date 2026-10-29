@@ -236,6 +236,7 @@ fn mock_notifications() -> NotifState {
         time_ft: 0,
         time_text: time.to_string(),
         icon_key: format!("name:{app}"),
+        aumid: String::new(),
     };
     NotifState {
         access: NotifAccess::Allowed,
@@ -533,9 +534,14 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             });
             crate::popup_settings::preview_with_screens(Vec::new())
         }
-        "popup_settings_screen" => {
-            // Two mock displays, bar moved to the second one.
-            crate::config::set(Config { monitor: "\\\\.\\DISPLAY2".into(), ..Config::default() });
+        "popup_settings_screen" | "popup_settings_pointer" => {
+            // Two mock displays, bar moved to the second one (or following the pointer).
+            let monitor = if name == "popup_settings_pointer" {
+                crate::config::MONITOR_POINTER.to_string()
+            } else {
+                "\\\\.\\DISPLAY2".to_string()
+            };
+            crate::config::set(Config { monitor, ..Config::default() });
             let d = |device: &str, label, primary| Screen { device: device.into(), label, primary };
             crate::popup_settings::preview_with_screens(vec![
                 d("\\\\.\\DISPLAY1", "1", true),
@@ -562,6 +568,48 @@ fn make_popup(name: &str, m: Metrics) -> Option<Box<dyn Content>> {
             can_launch: true,
         }),
         "popup_start" => crate::popup::popup_start::preview_new(),
+        "popup_startmenu" | "popup_startmenu_search" => {
+            const APPS: [(&str, char, u32); 20] = [
+                ("Adobe Acrobat", 'A', 0xB30B00),
+                ("Calculator", 'C', 0x3A3A3C),
+                ("Camera", 'C', 0x2B5797),
+                ("Discord", 'D', 0x5865F2),
+                ("File Explorer", 'E', 0xE8A317),
+                ("Firefox", 'F', 0xE66000),
+                ("GIMP", 'G', 0x5C5543),
+                ("Mail", 'M', 0x0F6CBD),
+                ("Microsoft Edge", 'E', 0x0C7CD5),
+                ("Notepad", 'N', 0x2D7D9A),
+                ("Paint", 'P', 0xC239B3),
+                ("Photos", 'P', 0x0063B1),
+                ("Settings", 'S', 0x4C4A48),
+                ("Spotify", 'S', 0x1DB954),
+                ("Steam", 'S', 0x1B2838),
+                ("Terminal", 'T', 0x2F2F2F),
+                ("Visual Studio Code", 'V', 0x007ACC),
+                ("VLC media player", 'V', 0xFF8800),
+                ("Windows Security", 'W', 0x107C10),
+                ("Xbox", 'X', 0x107C10),
+            ];
+            let pins = [
+                "firefox",
+                "visual studio code",
+                "terminal",
+                "spotify",
+                "steam",
+                "discord",
+                "file explorer",
+                "settings",
+            ];
+            crate::config::set(Config {
+                start_pins: pins.iter().map(|p| p.to_string()).collect(),
+                ..Config::default()
+            });
+            let apps =
+                APPS.iter().map(|&(n, l, c)| (n.to_lowercase(), n.to_string(), mock_icon(l, c, m.px(32)))).collect();
+            let query = if name == "popup_startmenu_search" { "te" } else { "" };
+            crate::popup::popup_startmenu::preview_new(apps, query)
+        }
         "popup_tray" | "popup_tray_customize" => {
             let ic = mock_icons(m, BarSizes::default());
             let bmps: Vec<Arc<IconBitmap>> = ic.tray.into_iter().map(Arc::new).collect();
@@ -715,11 +763,14 @@ pub fn run(dir: &str) -> i32 {
             ("popup_settings", 3),
             ("popup_settings_navy", 2),
             ("popup_settings_screen", 2),
+            ("popup_settings_pointer", 2),
             ("popup_settings_background", 4),
             ("popup_settings_presets", 3),
             ("popup_settings_sizes", 5),
             ("popup_app", 1),
             ("popup_start", 4),
+            ("popup_startmenu", 12),
+            ("popup_startmenu_search", 1),
             ("popup_tray", 1),
             ("popup_tray_customize", 2),
         ] {

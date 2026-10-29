@@ -96,8 +96,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use msg::{
     TIMER_ANIM, TIMER_APPS_DEBOUNCE, TIMER_CLOCK, TIMER_HOUSEKEEPING, TIMER_HOVER_PICKER, TIMER_POLL, TIMER_RAM,
     TIMER_RECONCILE, TIMER_SECOND, TIMER_TRAY_REANNOUNCE, WM_DOCK_CONFIG_APPLY, WM_DOCK_DIAG, WM_DOCK_NOTIF,
-    WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE, WM_DOCK_TRAY_CHANGED,
-    WM_DOCK_WINKEY,
+    WM_DOCK_POPUP_CLOSED, WM_DOCK_QUIT_REQUEST, WM_DOCK_START_MENU, WM_DOCK_TASKBAR_EVENT, WM_DOCK_TOGGLE,
+    WM_DOCK_TRAY_CHANGED, WM_DOCK_WINKEY,
 };
 
 // ---------------------------------------------------------------- constants
@@ -308,12 +308,17 @@ unsafe extern "system" fn wnd_proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> L
             ui::toggle();
             LRESULT(0)
         }
+        WM_DOCK_START_MENU => {
+            ui::open_start_menu();
+            LRESULT(0)
+        }
         WM_DOCK_WINKEY => {
             match wp.0 {
                 hook::EV_PRESSED => log!("Win pressed (swallowed)"),
                 hook::EV_ALONE => log!("Win released alone -> toggle dock"),
                 hook::EV_COMBO => log!("Win + other key -> injected the pair [Win down, key down]"),
                 hook::EV_SENDFAIL => log!("SendInput failed: Win+key combination NOT delivered"),
+                hook::EV_DOUBLE => log!("Win tapped twice -> Start menu"),
                 _ => {}
             }
             LRESULT(0)

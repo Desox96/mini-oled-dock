@@ -2,7 +2,7 @@
 
 A minimal, ultra-light, OLED-black floating dock for Windows 11, written in Rust with raw Win32 and no UI framework.
 
-> **About this fork.** The `mini-oled-dock-plus` branch is [gitgiovik/mini-oled-dock](https://github.com/gitgiovik/mini-oled-dock) with its open pull requests #1-#4 merged: Start button and quick-links menu (#1) and window previews (#2) by Desox, the multi-monitor screen choice (#3) and the AppBar position fix with clearer logs (#4). It is not an official release.
+> **About this fork.** The `mini-oled-dock-plus` branch is [gitgiovik/mini-oled-dock](https://github.com/gitgiovik/mini-oled-dock) with its open pull requests #1-#4 merged: Start button and quick-links menu (#1) and window previews (#2) by Desox, the multi-monitor screen choice (#3) and the AppBar position fix with clearer logs (#4). On top of that it adds its own features: the Win key brings the bar to the display under the pointer, a full Start menu written from scratch (all apps, search, its own pins) that opens with a double tap of Win or a left click on the Start button, on any display, and notifications that can be clicked, dismissed and cleared for real. It is not an official release.
 
 ![The bar](docs/screenshots/bar_top_icon_text.png)
 
@@ -26,23 +26,32 @@ It replaces the native taskbar with a small centred pill that hides when you do 
 |---|---|
 | ![](docs/screenshots/popup_windows.png) | ![](docs/screenshots/popup_settings_screen.png) |
 
+New in this fork:
+
+| Start menu (double tap Win) | Start menu: search | Settings: follow the pointer |
+|---|---|---|
+| ![](docs/screenshots/popup_startmenu.png) | ![](docs/screenshots/popup_startmenu_search.png) | ![](docs/screenshots/popup_settings_pointer.png) |
+
 ## Features
 
 - Centred bar sized to its content: pinned apps first, then open apps. An underline marks open windows (orange when an app asks for attention).
 - Display modes: icon + name, icon only, or name only.
-- Multi-monitor: the bar can sit on any connected display (Settings → **Screen**: **Main** or the display number) and follows that display's DPI; a display that is disconnected falls back to the primary one.
+- Multi-monitor: the bar can sit on any connected display (Settings → **Screen**: **Main**, the display number, or **Pointer** to follow the mouse) and follows that display's DPI; a display that is disconnected falls back to the primary one.
 - Independent sizes for app icons, app names, tray icons and the system modules (the bar height follows the tallest content); background colour from dark presets or any colour through a built-in picker (pure black by default); background opacity from 0 to 100 %.
 - **Settings popup** (from the power button): every option above, auto-hide, window previews, clock seconds and the visible modules, applied live.
 - Network module: Wi-Fi signal bars or ethernet, with a small globe when the internet is reachable (an x when it is not); click for name, IPv4 and signal.
 - System metrics module (off by default): CPU and RAM usage in percent; click opens Task Manager.
 - Drag and drop reordering of apps, tray icons and system modules.
 - Tray icon hosting, with an overflow popup and a view to choose which icons are visible.
-- Popups: notifications (with Do not disturb), audio (volume, mute, output device), calendar, network, power, settings, and an app menu (new window, pin / unpin, close).
+- Popups: notifications (with Do not disturb; click, X and Clear all work, see below), audio (volume, mute, output device), calendar, network, power, settings, and an app menu (new window, pin / unpin, close).
 - Window previews: hovering an app with several windows shows live DWM thumbnails with titles; click one to switch; off = no timer, no window.
 - Disabled features cost nothing: a hidden module has no timer, no polling and loads no system library; the network and metrics modules are polled only while the bar is visible.
 - Show desktop button.
-- Start button at the left end of the bar (before the apps): left click opens Start, right click opens a quick-links menu like the native Win+X one (Installed apps, Device Manager, Terminal (admin), PowerShell (admin), Task Manager, Settings, File Explorer, Search, Run, Sign out, ...), in Italian when the Windows display language is Italian and in English otherwise.
+- Start button at the left end of the bar (before the apps): left click opens the dock's Start menu (see below), right click opens a quick-links menu like the native Win+X one (Installed apps, Device Manager, Terminal (admin), PowerShell (admin), Task Manager, Settings, File Explorer, Search, Run, Sign out, ...), in Italian when the Windows display language is Italian and in English otherwise.
 - **Win key toggles the dock** (Win+other-key shortcuts still work), including over fullscreen games.
+- **Follow the pointer** (fork): with Settings -> Screen -> "Pointer", the Win key brings the bar to the display under the mouse pointer.
+- **Start menu on any display** (fork): a quick double tap of the Win key (or a left click on the Start button) opens the dock's own Start menu next to the Start button, on the display under the pointer (the native one only opens on the primary taskbar's display). It lists every app of the native Start menu, classic programs and Store apps alike; type to search (Enter launches the first result, arrows move the selection, Esc clears), and right-click an app to pin it at the top (`start_pins` in the config, separate from the bar pins). Double tap again or Esc to close.
+- **Working notifications** (fork): a click on a notification brings the app that sent it to the front (or launches it; if the app cannot be found, the Windows notification centre opens) and removes the notification; **Clear all** and the **X** of a single notification also remove them from Windows' notification history, so they no longer come back.
 - Auto-hide with a slide animation: the bar shows on the Win key or when the pointer touches the screen edge, and hides after 2.5 s.
 - Autostart without UAC prompts (scheduled task).
 - Watchdog process that always restores the native taskbar.
@@ -76,12 +85,14 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 
 ## Usage
 
-- **Show / hide:** Win key alone, or the screen edge.
+- **Show / hide:** Win key alone, or the screen edge. With Settings → Screen → **Pointer** the Win key brings the bar to the display under the pointer (if the bar is visible on another display it moves there instead of hiding).
+- **Start menu:** double tap the Win key (second tap within 300 ms; the first tap is not delayed) or left click the Start button. Type to search, Enter launches the first result, arrows and the wheel scroll, right click pins / unpins an app, Esc clears the search and then closes. Right click on the Start button still opens the quick-links menu.
+- **Notifications:** click one to switch to its app, X removes it, **Clear all** empties the list and the Windows history.
 - **App entries:** left click activates, minimises or cycles windows; middle click starts a new instance; right click opens the app menu; resting the pointer on an app with several windows shows a preview of each (click one to switch to it).
 - **Volume:** wheel changes it, middle click mutes, left click opens the audio popup.
 - **Network:** left click opens the network popup (connection, internet, IPv4, signal, "Network settings"); right click opens Windows' network settings.
 - **System metrics:** click opens Task Manager.
-- **Settings:** power button, then **Settings**: position, screen (with two or more displays: **Main** or the display number), display mode, auto-hide, window previews, clock seconds, one switch per module, **Choose tray icons** (which tray icons stay in the bar) and two sub-pages:
+- **Settings:** power button, then **Settings**: position, screen (with two or more displays: **Main**, the display number or **Pointer**), display mode, auto-hide, window previews, clock seconds, one switch per module, **Choose tray icons** (which tray icons stay in the bar) and two sub-pages:
   - **Background ›**: seven dark presets (Black, Graphite, Slate, Navy, Plum, Wine, Forest) and a custom swatch that opens a colour picker (saturation/value square, hue strip, preview and hex code; drag to pick), plus the **Opacity** slider (0-100 %, background only: at 0 % only text and icons are visible and the bar still reacts to the mouse).
   - **Sizes ›**: sliders for app icons, app names, tray icons and modules, and **Reset sizes**.
 
@@ -97,7 +108,7 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | Option | Default | Meaning |
 |---|---|---|
 | `position` | `"bottom"` | `"top"` or `"bottom"` |
-| `monitor` | `""` | Display the bar sits on: `""` = primary monitor, or a device name such as `"\\\\.\\DISPLAY2"`. A display that is not connected falls back to the primary one |
+| `monitor` | `""` | Display the bar sits on: `""` = primary monitor, or a device name such as `"\\\\.\\DISPLAY2"`. A display that is not connected falls back to the primary one. `"pointer"` = the Win key brings the bar to the display under the mouse pointer |
 | `display_mode` | `"icon_text"` | `"icon_text"`, `"icon"` or `"text"` |
 | `app_icon_size` | `16` | App icon size in logical px, 14-32 |
 | `app_text_size` | `13` | App name text size in logical px, 10-18 |
@@ -117,6 +128,7 @@ The logon task runs the dock elevated, so the installed copy lives in an admin-o
 | `show_notifications` / `show_volume` / `show_clock` / `show_desktop_button` | `true` | Show the other system modules (a hidden module costs nothing) |
 | `show_start_button` | `true` | Start button at the left end of the bar (a fixed item, not a movable module) |
 | `pinned` | `[]` | Pinned apps, in display order |
+| `start_pins` | `[]` | Apps pinned at the top of the dock's Start menu (separate from `pinned`; right click an app in the menu to add or remove it) |
 | `names` | `{}` | Display-name overrides (key: lowercase exe name or AUMID) |
 
 The bar height follows the tallest content; the defaults give the original 36 px bar. An old `bar_size` value (`"small"`, `"medium"`, `"large"`) is converted once into the four sizes.
@@ -153,8 +165,8 @@ Stop-Process -Name explorer -Force; Start-Process explorer
 
 ## Limitations
 
-- One bar, on one display (the primary monitor unless another is chosen in Settings); the dock does not reserve work area, so maximised windows go under the bar.
-- The notification list needs Windows notification access (asked once). Switching the audio output and Do not disturb use undocumented COM interfaces that a Windows update could break.
+- One bar, on one display at a time (the primary monitor unless another is chosen in Settings, or the display under the pointer with **Pointer**); the dock does not reserve work area, so maximised windows go under the bar.
+- The notification list needs Windows notification access (asked once). Windows does not let an unpackaged app activate or dismiss another app's notification directly: a click on a notification brings up the app that sent it (its window, or a launch), and Clear all / X go through each app's notification history. Switching the audio output and Do not disturb use undocumented COM interfaces that a Windows update could break.
 - Tray hosting only works while the native taskbar is hidden.
 - Developed and tested on Windows 11 only.
 

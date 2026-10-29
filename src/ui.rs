@@ -22,8 +22,8 @@
 //!  * Click: apps (left, middle and right click), bell (Win+N via `SendInput` with
 //!    `hook::INJECT_TAG` in `dwExtraInfo`), volume (toggle mute / `ms-settings:apps-volume`), clock
 //!    (`ms-settings:dateandtime`), network (popup / right click `ms-settings:network`), metrics
-//!    (Task Manager), Start button (fixed item at the left end, not draggable: left click = synthetic Win press
-//!    on the shell thread, right click = quick-links popup, `popup_start`).
+//!    (Task Manager), Start button (fixed item at the left end, not draggable: left click = the dock's Start menu
+//!    `popup_startmenu`, right click = quick-links popup, `popup_start`).
 //!  * System monitor (`TIMER_SYSMON`, `sysmon_sync`): network and metrics modules, polled only while
 //!    the bar is visible; a disabled module has no timer, no state and nothing loaded.
 //!  * Themed context menu (`popup::open_app_menu`, command in `WM_DOCK_APP_MENU_CMD`): Pin/Unpin
@@ -35,6 +35,8 @@
 //!  * DPI: `WM_DPICHANGED`/`WM_DISPLAYCHANGE` -> recompute metrics, fonts, icons, geometry.
 //!  * Display: the bar sits on `config.monitor` (`dock_hmonitor`), the primary monitor when it is
 //!    empty or that display is not connected; `WM_DISPLAYCHANGE` moves it when displays come and go.
+//!    With `config.monitor == "pointer"` the Win key brings the bar to the display under the pointer
+//!    (`follow_pointer`), and a double tap opens the dock's Start menu there (`open_start_menu`, `popup_startmenu`).
 //!  * Auto-hide (screen edge, Win key, 2.5 s timeout); `config::effective_autohide()`
 //!    false = always visible.
 //!
@@ -42,6 +44,7 @@
 //! no `borrow` of `UI` is held across calls that pump messages (`SetWindowPos`, `present`).
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use windows::core::BOOL;
@@ -342,6 +345,9 @@ thread_local! {
     static GEOM: Cell<Option<Geom>> = const { Cell::new(None) };
     /// HMONITOR (as isize) the bar was last placed on, to log a display change once.
     static LAST_HMON: Cell<isize> = const { Cell::new(0) };
+    /// "pointer" mode (`config::MONITOR_POINTER`): HMONITOR (as isize) the Win key last brought the
+    /// bar to; 0 = not chosen yet (the display under the pointer is used).
+    static FOLLOW_HMON: Cell<isize> = const { Cell::new(0) };
     static POLL_TICKS: Cell<u32> = const { Cell::new(0) };
     static VIS: Cell<VisAnim> = const { Cell::new(VisAnim { from: 0.0, to: 0.0, start: 0, dur: 1, running: false }) };
     /// Windows that asked for attention (FlashWindowEx) and were not activated yet.
@@ -576,13 +582,79 @@ fn on_timer(h: HWND, id: usize) -> Option<LRESULT> {
     Some(LRESULT(0))
 }
 
-/// Win key alone (`WM_DOCK_TOGGLE`): shows or hides the dock.
+/// Win key alone (`WM_DOCK_TOGGLE`): shows or hides the dock. In "pointer" mode the bar first moves
+/// to the display under the pointer; if it was visible on another display it stays visible there.
 pub fn toggle() {
-    if VISIBLE.load(Relaxed) {
+    let moved = follow_pointer();
+    if VISIBLE.load(Relaxed) && !moved {
         hide_dock("Win alone (toggle)");
     } else {
-        show_dock("Win alone (toggle)", SHOW_MS);
+        show_dock(if moved { "Win alone (pointer display)" } else { "Win alone (toggle)" }, SHOW_MS);
     }
+}
+
+/// Win key tapped twice (`WM_DOCK_START_MENU`): opens (or closes) the dock's own Start menu
+/// (`popup_startmenu`: all apps, search, pins) on the bar, which in "pointer" mode is first brought
+/// to the display under the pointer. The first tap already toggled the bar, so it is shown again if
+/// that tap hid it.
+pub fn open_start_menu() {
+    follow_pointer();
+    if !VISIBLE.load(Relaxed) {
+        show_dock("Win double tap (Start menu)", SHOW_MS);
+    }
+    match anchor_for(ItemId::Start).or_else(bar_start_anchor) {
+        Some(a) => popup::toggle(PopupKind::StartMenu, a),
+        None => log!("open_start_menu: the bar has no geometry yet"),
+    }
+}
+
+/// Anchor at the left end of the bar, for the Start popup when the Start button is hidden.
+fn bar_start_anchor() -> Option<Anchor> {
+    let g = GEOM.with(|g| g.get())?;
+    let dpi = UI.with(|u| {
+        let st = u.borrow();
+        if st.monitor_dpi >= 96 {
+            st.monitor_dpi
+        } else {
+            st.metrics.dpi
+        }
+    });
+    Some(Anchor {
+        item: RECT { left: g.x, top: g.y, right: g.x + g.h, bottom: g.y + g.h },
+        bar: RECT { left: g.x, top: g.y, right: g.x + g.w, bottom: g.y + g.h },
+        top: config_top(),
+        dpi,
+    })
+}
+
+/// true when the bar follows the pointer (`config.monitor == "pointer"`).
+fn follows_pointer() -> bool {
+    config::get().monitor.eq_ignore_ascii_case(config::MONITOR_POINTER)
+}
+
+/// Display under the mouse pointer (the nearest one if the pointer position cannot be read).
+fn pointer_hmonitor() -> HMONITOR {
+    let p = cursor_pos().unwrap_or_default();
+    // SAFETY: MonitorFromPoint with MONITOR_DEFAULTTONEAREST has no preconditions and always returns a monitor.
+    unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) }
+}
+
+/// "pointer" mode: brings the bar to the display under the pointer (metrics, fonts, icons and
+/// geometry follow that display's DPI). Returns true if the bar changed display.
+fn follow_pointer() -> bool {
+    if !follows_pointer() {
+        return false;
+    }
+    let h = pointer_hmonitor();
+    let prev = FOLLOW_HMON.with(|c| c.replace(h.0 as isize));
+    if prev == h.0 as isize || GEOM.with(|g| g.get()).is_none() {
+        return false;
+    }
+    // A popup or the picker anchored to the old position would be left behind.
+    popup::close("bar moved to the pointer display");
+    picker_cancel("bar moved to the pointer display");
+    apply_dpi(dock_dpi());
+    true
 }
 
 /// The config changed on disk (`config::poll_changed` returned true): rebuilds the items
@@ -732,7 +804,7 @@ fn item_for_popup(kind: PopupKind) -> Option<ItemId> {
         PopupKind::Power | PopupKind::Settings => Some(ItemId::Power),
         PopupKind::TrayOverflow => Some(ItemId::TrayOverflow),
         PopupKind::Network => Some(ItemId::Network),
-        PopupKind::Start => Some(ItemId::Start),
+        PopupKind::Start | PopupKind::StartMenu => Some(ItemId::Start),
         PopupKind::AppMenu => None,
     }
 }
@@ -1304,9 +1376,19 @@ fn request_missing() {
 
 /// Applies a result from the shell thread; true if something changed.
 fn apply_shell_event(ev: ShellEvent) -> bool {
-    if let ShellEvent::Network(info) = ev {
-        return apply_network(info);
-    }
+    // Network and Start menu data go to the popups OUTSIDE the `UI` borrow (they may relayout).
+    let ev = match ev {
+        ShellEvent::Network(info) => return apply_network(info),
+        ShellEvent::StartApps(list) => {
+            popup::on_start_apps(list);
+            return false;
+        }
+        ShellEvent::StartIcons { icon_px, icons } => {
+            popup::on_start_icons(icon_px, icons);
+            return false;
+        }
+        other => other,
+    };
     UI.with(|u| {
         let st = &mut *u.borrow_mut();
         let px = st.sizes.icon_px(st.metrics) as u32;
@@ -1337,8 +1419,8 @@ fn apply_shell_event(ev: ShellEvent) -> bool {
                 crate::popup::on_audio_outputs(list);
                 false
             }
-            // Handled by `apply_network` before the borrow.
-            ShellEvent::Network(_) => false,
+            // Handled before the borrow.
+            ShellEvent::Network(_) | ShellEvent::StartApps(_) | ShellEvent::StartIcons { .. } => false,
         }
     })
 }
@@ -2280,9 +2362,14 @@ fn click_left(id: ItemId) {
             popup::close("show desktop");
             shell_thread::request(ShellRequest::ToggleDesktop);
         }
+        // Left click opens the dock's own Start menu (`popup_startmenu`), like the Win double tap;
+        // without a popup (class not registered) it falls back to the Windows Start menu.
         ItemId::Start => {
-            popup::close("start");
-            shell_thread::request(ShellRequest::OpenStart);
+            if popup::is_available() {
+                toggle_popup(PopupKind::StartMenu, id);
+            } else {
+                shell_thread::request(ShellRequest::OpenStart);
+            }
         }
         ItemId::Network => {
             if popup::is_available() {
@@ -2302,6 +2389,43 @@ fn click_left(id: ItemId) {
 /// `pub` because the notifications popup also uses it ("Open notification center").
 pub fn send_win_n() {
     send_win_key(VK_N);
+}
+
+/// Click on a notification card (`popup_notif`). Windows offers no way to activate another app's
+/// toast, so the app that sent it is brought up instead: its most recent window if it has one (the
+/// group with the same AUMID, or a bar item / exe with the same name), otherwise the shell thread
+/// launches it from the AppsFolder catalog (`ShellRequest::OpenNotifApp`, Win+N as the last resort).
+pub fn open_notification_app(aumid: &str, app: &str) {
+    let groups = apps::groups();
+    let alive = |g: &&apps::AppGroup| !g.windows.is_empty();
+    let by_aumid = (!aumid.is_empty())
+        .then(|| {
+            groups.iter().filter(alive).find(|g| g.aumid.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(aumid)))
+        })
+        .flatten();
+    let by_name = || {
+        if app.is_empty() {
+            return None;
+        }
+        let key = UI.with(|u| {
+            u.borrow()
+                .entries
+                .iter()
+                .find(|e| !e.windows.is_empty() && e.name.eq_ignore_ascii_case(app))
+                .map(|e| e.group_key.clone())
+        });
+        key.and_then(|k| groups.iter().filter(alive).find(|g| g.key == k)).or_else(|| {
+            groups.iter().filter(alive).find(|g| {
+                Path::new(&g.exe_path).file_stem().is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(app))
+            })
+        })
+    };
+    if let Some(g) = by_aumid.or_else(by_name) {
+        log!("notification: activating '{}' ({} windows)", g.key, g.windows.len());
+        apps::activate_window(g.windows[0]);
+        return;
+    }
+    shell_thread::request(ShellRequest::OpenNotifApp { aumid: aumid.to_string(), name: app.to_string() });
 }
 
 /// Win + `vk` pressed and released with `dwExtraInfo = INJECT_TAG` (Win+N, Win+S, Win+R ...).
@@ -2457,6 +2581,9 @@ pub fn screens() -> Vec<Screen> {
 /// The display the bar belongs on: `config.monitor` if it is connected, otherwise the primary one.
 fn dock_hmonitor() -> HMONITOR {
     let want = config::get().monitor.clone();
+    if want.eq_ignore_ascii_case(config::MONITOR_POINTER) {
+        return followed_hmonitor();
+    }
     let found = if want.is_empty() {
         None
     } else {
@@ -2472,6 +2599,28 @@ fn dock_hmonitor() -> HMONITOR {
         } else {
             log!("monitor: the bar uses {}", if want.is_empty() { "the primary monitor" } else { want.as_str() });
         }
+    }
+    h
+}
+
+/// "pointer" mode: the display the Win key last brought the bar to, as long as it is connected;
+/// otherwise (first use, display unplugged) the display under the pointer, which becomes the new one.
+fn followed_hmonitor() -> HMONITOR {
+    let cur = FOLLOW_HMON.with(|c| c.get());
+    let mons = enum_monitors();
+    let h = match mons.iter().find(|(m, _)| cur != 0 && m.0 as isize == cur) {
+        Some((m, _)) => *m,
+        None => {
+            let m = pointer_hmonitor();
+            FOLLOW_HMON.with(|c| c.set(m.0 as isize));
+            m
+        }
+    };
+    // Logged only when the display actually changes.
+    let prev = LAST_HMON.with(|c| c.replace(h.0 as isize));
+    if prev != h.0 as isize {
+        let name = mons.iter().find(|(m, _)| *m == h).map(|(_, mi)| device_name(mi)).unwrap_or_default();
+        log!("monitor: the bar follows the pointer, now on {name}");
     }
     h
 }

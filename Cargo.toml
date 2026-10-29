@@ -21,6 +21,7 @@ windows-future = "0.3.2"
 windows-collections = "0.3.2"
 windows = { version = "0.62.2", features = [
     "ApplicationModel",
+    "Data_Xml_Dom",
     "Foundation",
     "Foundation_Collections",
     "Storage_Streams",

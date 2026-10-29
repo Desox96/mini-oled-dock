@@ -14,6 +14,10 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+/// `Config::monitor` value meaning "follow the pointer": the Win key brings the bar to the display
+/// under the mouse pointer (Settings -> Screen -> "Pointer").
+pub const MONITOR_POINTER: &str = "pointer";
+
 /// Position of the bar.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -163,6 +167,7 @@ pub struct Config {
     pub position: Position,
     /// Display the bar sits on: empty = the primary monitor (default), otherwise a GDI device name
     /// such as "\\.\DISPLAY2". A display that is not connected falls back to the primary one.
+    /// `MONITOR_POINTER` ("pointer") = the Win key brings the bar to the display under the pointer.
     pub monitor: String,
     pub autohide: bool,
     /// Window picker with live DWM thumbnails when the pointer rests on an app with 2+ windows
@@ -170,6 +175,9 @@ pub struct Config {
     pub window_previews: bool,
     pub hide_native_taskbar: bool,
     pub pinned: Vec<PinnedApp>,
+    /// Apps pinned at the top of the Start menu opened by the Win double tap (`popup_startmenu`),
+    /// in order: AppsFolder ids (`shell_thread::StartApp::id`). Separate from the bar's `pinned`.
+    pub start_pins: Vec<String>,
     /// Name overrides: key = lowercase exe file name (e.g. "code.exe") or AUMID;
     /// value = name to show.
     pub names: BTreeMap<String, String>,
@@ -261,6 +269,7 @@ impl Default for Config {
             window_previews: true,
             hide_native_taskbar: true,
             pinned: Vec::new(),
+            start_pins: Vec::new(),
             names: BTreeMap::new(),
             show_date: true,
             show_volume_percent: true,
@@ -461,6 +470,7 @@ fn render(c: &Config) -> String {
   // Display the bar sits on: "" = the primary monitor, or a device name such as "\\\\.\\DISPLAY2".
   // Normally chosen in Settings -> Screen (shown with two or more displays). If that display is
   // not connected the bar uses the primary monitor, and moves back when it returns.
+  // "pointer" = the Win key shows the bar (and a double tap the Start menu) on the display under the pointer.
   "monitor": {monitor},
 
   // What each entry shows: "icon_text" (icon + name), "icon" (icon only) or "text" (name only).
@@ -567,6 +577,11 @@ fn render(c: &Config) -> String {
   // List the AUMIDs of installed apps with:  Get-StartApps   (PowerShell)
   "pinned": {pinned},
 
+  // Apps pinned at the top of the Start menu that a double tap of the Win key opens (separate from
+  // the bar pins above). Normally managed with a right click on an app in that menu. Each entry is
+  // the app's id inside shell:AppsFolder (an AUMID for Store apps); see:  Get-StartApps  (PowerShell)
+  "start_pins": {start_pins},
+
   // Order of the open apps that are NOT pinned (their keys). Pinned apps follow the "pinned" order
   // above. Normally managed by dragging an entry in the bar; apps not listed go last, in the order
   // they were first seen. At most 64 keys are kept.
@@ -614,6 +629,7 @@ fn render(c: &Config) -> String {
         modules_order = js_block(&c.modules_order),
         tray_guids = js_block(&c.tray_hidden_guids),
         pinned = js_block(&c.pinned),
+        start_pins = js_block(&c.start_pins),
         names = js_block(&c.names),
         notif = c.notif_prompted,
     )
@@ -947,6 +963,27 @@ pub fn unpin(key: &str) -> Result<(), String> {
     modify(|c| c.pinned.retain(|p| !p.key.eq_ignore_ascii_case(key)))
 }
 
+impl Config {
+    /// true if the AppsFolder app `id` is pinned in the Start menu (case-insensitive).
+    pub fn is_start_pinned(&self, id: &str) -> bool {
+        self.start_pins.iter().any(|p| p.eq_ignore_ascii_case(id))
+    }
+}
+
+/// Pins (appended last) or unpins the AppsFolder app `id` in the Start menu and saves.
+fn toggle_start_pin_in(c: &mut Config, id: &str) {
+    if c.is_start_pinned(id) {
+        c.start_pins.retain(|p| !p.eq_ignore_ascii_case(id));
+    } else if !id.trim().is_empty() {
+        c.start_pins.push(id.to_string());
+    }
+}
+
+/// Start menu right click: pins the app if it is not pinned, unpins it otherwise.
+pub fn toggle_start_pin(id: &str) -> Result<(), String> {
+    modify(|c| toggle_start_pin_in(c, id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1088,23 @@ mod tests {
         set_pinned_name(&mut c, "stremio", "Stremio");
         assert_eq!(c.pinned[0].name, "Stremio");
         assert!(!pinned_name_differs(&c, "stremio", "Stremio"));
+    }
+
+    #[test]
+    fn start_pins_toggle_and_roundtrip() {
+        let mut c = Config::default();
+        toggle_start_pin_in(&mut c, "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App");
+        toggle_start_pin_in(&mut c, "{6D809377-6AF0-444B-8957-A3773F02200E}\\Git\\git-bash.exe");
+        assert_eq!(c.start_pins.len(), 2);
+        assert!(c.is_start_pinned("microsoft.windowscalculator_8wekyb3d8bbwe!app"));
+        let r = render(&c);
+        assert!(r.contains("\"start_pins\""));
+        assert_eq!(parse(&r).unwrap(), c);
+        // Second toggle (any case) unpins; an empty id is never pinned.
+        toggle_start_pin_in(&mut c, "MICROSOFT.WINDOWSCALCULATOR_8WEKYB3D8BBWE!APP");
+        toggle_start_pin_in(&mut c, " ");
+        assert_eq!(c.start_pins, vec!["{6D809377-6AF0-444B-8957-A3773F02200E}\\Git\\git-bash.exe".to_string()]);
+        assert!(Config::default().start_pins.is_empty());
     }
 
     #[test]
